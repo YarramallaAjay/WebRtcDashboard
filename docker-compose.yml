@@ -1,0 +1,83 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: skylark-postgres
+    environment:
+      POSTGRES_DB: camera_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres123
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d camera_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  mediamtx:
+    image: bluenviron/mediamtx:latest
+    container_name: skylark-mediamtx
+    environment:
+      MTX_PROTOCOLS: "tcp"
+      MTX_WEBRTCADDITIONALHOSTS: "localhost,host.docker.internal"
+    ports:
+      - "8554:8554"    # RTSP
+      - "8889:8889"    # WebRTC HTTP
+      - "8890:8890/udp" # WebRTC ICE
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:8889 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  backend:
+    build: ./backend
+    container_name: skylark-backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres123@postgres:5432/camera_db
+      - JWT_SECRET=skylark-development-secret-2024
+      - WORKER_URL=http://worker:8080
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./backend:/app
+      - /app/node_modules
+
+  worker:
+    build: ./worker
+    container_name: skylark-worker
+    depends_on:
+      - backend
+      - mediamtx
+    environment:
+      - BACKEND_URL=http://backend:3000
+      - MEDIAMTX_URL=rtsp://mediamtx:8554
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./worker:/app
+
+  frontend:
+    build: ./frontend
+    container_name: skylark-frontend
+    depends_on:
+      - backend
+    environment:
+      - VITE_BACKEND_URL=http://localhost:3000
+      - VITE_WEBSOCKET_URL=http://localhost:3000
+      - VITE_MEDIAMTX_URL=http://localhost:8889
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+
+volumes:
+  postgres_data:
