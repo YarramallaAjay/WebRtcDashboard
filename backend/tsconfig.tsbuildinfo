@@ -1,0 +1,1 @@
+{"root":["./src/index.ts","./src/schemas.ts","./src/types.ts","./src/websocket.ts","./src/auth/middleware.ts","./src/auth/utils.ts","./src/routes/alerts.ts","./src/routes/auth.ts","./src/routes/cameracontrol.ts","./src/routes/cameras.ts","./src/utils/db.ts"],"version":"5.9.2"}

@@ -1,12 +1,12 @@
-FROM node:18-alpine
+FROM node:latest
 
-WORKDIR /app
+WORKDIR /src
 
 # Copy package files
 COPY package*.json ./
 
 # Install dependencies
-RUN npm ci --only=production
+RUN npm install
 
 # Copy source code
 COPY . .
@@ -17,5 +17,8 @@ RUN npx prisma generate
 # Expose port
 EXPOSE 3000
 
-# Start the application
-CMD ["npm", "start"]
+# Set environment to development
+ENV NODE_ENV=development
+
+# Start the application in development mode
+CMD ["npm", "run", "dev"]

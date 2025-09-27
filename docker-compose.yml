@@ -5,15 +5,15 @@ services:
     image: postgres:15
     container_name: skylark-postgres
     environment:
-      POSTGRES_DB: camera_db
+      POSTGRES_DB: streamer_db
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres123
+      POSTGRES_PASSWORD: streamer123
     ports:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d camera_db"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d streamer_db"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -41,8 +41,8 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      - DATABASE_URL=postgresql://postgres:postgres123@postgres:5432/camera_db
-      - JWT_SECRET=skylark-development-secret-2024
+      - DATABASE_URL=postgresql://postgres:streamer123@postgres:5432/streamer_db
+      - JWT_SECRET=skylark-assignment-BD
       - WORKER_URL=http://worker:8080
     ports:
       - "3000:3000"
