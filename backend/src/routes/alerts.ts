@@ -1,31 +1,16 @@
 import { Hono } from 'hono';
 import { zValidator } from '@hono/zod-validator';
 import { prisma } from '../utils/db.js';
-import { authMiddleware } from '../auth/middleware.js';
+// import { authMiddleware } from '../auth/middleware.js'; // Disabled for Phase 1
 import { JWTPayload, Variables } from '../types.js';
 // import { broadcastAlert } from '../websocket.js';
-import { alertQuerySchema, createAlertSchema, uuidParamSchema } from '../schemas.js';
+import { alertQuerySchema, createAlertSchema, cuidParamSchema } from '../schemas.js';
 
 const alerts = new Hono<{ Variables: Variables }>();
 
-// GET /api/alerts - Get alerts (public for internal worker use, protected for user queries)
+// GET /api/alerts - Get alerts (no auth for testing)
 alerts.get('/', async (c) => {
   try {
-    // Check if request has auth header for user queries
-    const authHeader = c.req.header('Authorization');
-    let userId: string | undefined;
-
-    if (authHeader && authHeader.startsWith('Bearer ')) {
-      // This is a user request - apply authentication
-      try {
-        await authMiddleware(c, async () => {});
-        const user = c.get('user');
-        userId = user.userId;
-      } catch (error) {
-        return c.json({ error: 'Invalid token' }, 401);
-      }
-    }
-
     const cameraId = c.req.query('cameraId');
     const limit = parseInt(c.req.query('limit') || '50');
     const offset = parseInt(c.req.query('offset') || '0');
@@ -36,13 +21,6 @@ alerts.get('/', async (c) => {
       whereClause.cameraId = cameraId;
     }
 
-    // If user is authenticated, only show their alerts
-    if (userId) {
-      whereClause.camera = {
-        userId: userId
-      };
-    }
-
     const alertsList = await prisma.alert.findMany({
       where: whereClause,
       include: {
@@ -50,8 +28,7 @@ alerts.get('/', async (c) => {
           select: {
             id: true,
             name: true,
-            location: true,
-            userId: true
+            location: true
           }
         }
       },
@@ -60,17 +37,12 @@ alerts.get('/', async (c) => {
       skip: offset
     });
 
-    // Filter out alerts for cameras not owned by user if userId is set
-    const filteredAlerts = userId
-      ? alertsList.filter(alert => alert.camera.userId === userId)
-      : alertsList;
-
     const total = await prisma.alert.count({
       where: whereClause
     });
 
     return c.json({
-      alerts: filteredAlerts,
+      alerts: alertsList,
       total,
       limit,
       offset
@@ -107,8 +79,7 @@ alerts.post('/', zValidator('json', createAlertSchema), async (c) => {
           select: {
             id: true,
             name: true,
-            location: true,
-            userId: true
+            location: true
           }
         }
       }
@@ -128,19 +99,16 @@ alerts.post('/', zValidator('json', createAlertSchema), async (c) => {
   }
 });
 
-// DELETE /api/alerts/:id - Delete specific alert (user only)
-alerts.delete('/:id', authMiddleware, zValidator('param', uuidParamSchema), async (c) => {
+// DELETE /api/alerts/:id - Delete specific alert (no auth for testing)
+alerts.delete('/:id', zValidator('param', cuidParamSchema), async (c) => {
   try {
-    const user = c.get('user');
+    // const user = c.get('user'); // Disabled for Phase 1 testing
     const { id: alertId } = c.req.valid('param');
 
-    // Check if alert exists and belongs to user's camera
+    // Check if alert exists (simplified for testing without auth)
     const alert = await prisma.alert.findFirst({
       where: {
-        id: alertId,
-        camera: {
-          userId: user.userId
-        }
+        id: alertId
       }
     });
 

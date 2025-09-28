@@ -32,18 +32,18 @@ export const paginationSchema = z.object({
 });
 
 export const alertQuerySchema = z.object({
-  cameraId: z.string().uuid().optional(),
+  cameraId: z.string().min(1).optional(),
   ...paginationSchema.shape,
 });
 
 // Parameter schemas
-export const uuidParamSchema = z.object({
-  id: z.string().uuidv4(),
+export const cuidParamSchema = z.object({
+  id: z.string().min(1),
 });
 
 // Alert creation schema (for worker service)
 export const createAlertSchema = z.object({
-  cameraId: z.string().uuid(),
+  cameraId: z.string().min(1),
   frameUrl: z.string().url().optional(),
   metadata: z.record(z.string(), z.any()).optional(),
 });

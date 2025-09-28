@@ -10,31 +10,26 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-model User {
-  id        String   @id @default(uuid())
-  username  String   @unique
-  password  String   // bcrypt hashed
-  cameras   Camera[]
-  createdAt DateTime @default(now())
-}
-
 model Camera {
-  id        String   @id @default(uuid())
+  id        String   @id @default(cuid())
   name      String
   rtspUrl   String
   location  String?
   enabled   Boolean  @default(false)
-  userId    String
-  user      User     @relation(fields: [userId], references: [id])
-  alerts    Alert[]
+  status    String   @default("OFFLINE") // OFFLINE, CONNECTING, STREAMING, ERROR
   createdAt DateTime @default(now())
+  alerts    Alert[]
+
+  @@map("cameras")
 }
 
 model Alert {
-  id          String   @id @default(uuid())
-  cameraId    String
-  camera      Camera   @relation(fields: [cameraId], references: [id])
-  frameUrl    String?
-  detectedAt  DateTime @default(now())
-  metadata    Json?
+  id         String   @id @default(cuid())
+  cameraId   String
+  camera     Camera   @relation(fields: [cameraId], references: [id])
+  frameUrl   String?
+  detectedAt DateTime @default(now())
+  metadata   Json?
+
+  @@map("alerts")
 }

@@ -23,6 +23,7 @@
     "@types/jsonwebtoken": "^9.0.10",
     "bcrypt": "^6.0.0",
     "bcryptjs": "^3.0.2",
+    "dotenv": "^17.2.2",
     "hono": "^4.9.8",
     "jsonwebtoken": "^9.0.2",
     "prisma": "^6.16.2",

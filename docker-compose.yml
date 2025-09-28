@@ -1,23 +1,6 @@
 version: '3.8'
 
 services:
-  postgres:
-    image: postgres:15
-    container_name: skylark-postgres
-    environment:
-      POSTGRES_DB: streamer_db
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: streamer123
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d streamer_db"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-
   mediamtx:
     image: bluenviron/mediamtx:latest
     container_name: skylark-mediamtx
@@ -37,11 +20,8 @@ services:
   backend:
     build: ./backend
     container_name: skylark-backend
-    depends_on:
-      postgres:
-        condition: service_healthy
     environment:
-      - DATABASE_URL=postgresql://postgres:streamer123@postgres:5432/streamer_db
+      - DATABASE_URL=postgresql://neondb_owner:npg_P03qRGsHMAKm@ep-billowing-sea-a1g45uuo-pooler.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require
       - JWT_SECRET=skylark-assignment-BD
       - WORKER_URL=http://worker:8080
     ports:
@@ -79,5 +59,4 @@ services:
       - ./frontend:/app
       - /app/node_modules
 
-volumes:
-  postgres_data:
+# volumes:
