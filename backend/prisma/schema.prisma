@@ -11,14 +11,20 @@ datasource db {
 }
 
 model Camera {
-  id        String   @id @default(cuid())
-  name      String
-  rtspUrl   String
-  location  String?
-  enabled   Boolean  @default(false)
-  status    String   @default("OFFLINE") // OFFLINE, CONNECTING, STREAMING, ERROR
-  createdAt DateTime @default(now())
-  alerts    Alert[]
+  id               String   @id @default(cuid())
+  name             String
+  rtspUrl          String
+  location         String?
+  enabled          Boolean  @default(false)
+  status           String   @default("OFFLINE") // OFFLINE, CONNECTING, PROCESSING, ERROR
+  createdAt        DateTime @default(now())
+
+  // MediaMTX path persistence fields
+  mediamtxPath     String?  // e.g., "camera_cmg50ydx70000o11fwualje1l"
+  mediamtxConfigured Boolean @default(false)
+  lastProcessedAt  DateTime?
+
+  alerts           Alert[]
 
   @@map("cameras")
 }

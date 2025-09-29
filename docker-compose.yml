@@ -1,27 +1,66 @@
-version: '3.8'
-
 services:
+
+  kafka:
+    image: apache/kafka:latest
+    container_name: skylark-kafka
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://localhost:9092,CONTROLLER://localhost:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 3
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+    volumes:
+      - /var/lib/kafka/data:/var/lib/kafka/data
+    networks:
+      - default
+
+
+
   mediamtx:
-    image: bluenviron/mediamtx:latest
+    image: bluenviron/mediamtx:1.8.5
     container_name: skylark-mediamtx
     environment:
       MTX_PROTOCOLS: "tcp"
-      MTX_WEBRTCADDITIONALHOSTS: "localhost,host.docker.internal"
+      MTX_WEBRTCADDITIONALHOSTS: "localhost,host.docker.internal,127.0.0.1"
+      MTX_API: "yes"
+      MTX_APILISTEN: "0.0.0.0:9997"
+      MTX_WEBRTCLISTEN: "0.0.0.0:8891"
+      MTX_RTSPLISTEN: "0.0.0.0:8554"
+      MTX_READTIMEOUT: "10s"
+      MTX_WRITETIMEOUT: "10s"
+      MTX_WRITEBUFFERSIZE: "65536"
+      MTX_RTSPSTRANSPORT: "tcp"
+      MTX_RTSPTRANSPORT: "tcp"
+      MTX_WEBRTCICECANDIDATETYPE: "host"
     ports:
       - "8554:8554"    # RTSP
-      - "8889:8889"    # WebRTC HTTP
-      - "8890:8890/udp" # WebRTC ICE
-    healthcheck:
-      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:8889 || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
+      - "9997:9997"    # API Server
+      - "8891:8891"    # WebRTC HTTP
+      - "8191:8191/udp" # WebRTC ICE/UDP
+    volumes:
+      - ./worker/mediamtx/webrtc-config.yml:/mediamtx.yml:ro
+    networks:
+      - default
+    restart: unless-stopped
 
   backend:
     build: ./backend
     container_name: skylark-backend
+    depends_on:
+      - mediamtx
     environment:
-      - DATABASE_URL=postgresql://neondb_owner:npg_P03qRGsHMAKm@ep-billowing-sea-a1g45uuo-pooler.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require
+      - PORT=3000
+      - DATABASE_URL=${DATABASE_URL}
       - JWT_SECRET=skylark-assignment-BD
       - WORKER_URL=http://worker:8080
     ports:
@@ -29,34 +68,45 @@ services:
     volumes:
       - ./backend:/app
       - /app/node_modules
+    restart: unless-stopped
 
   worker:
     build: ./worker
     container_name: skylark-worker
     depends_on:
-      - backend
       - mediamtx
+      - backend
     environment:
+      - PORT=8080
       - BACKEND_URL=http://backend:3000
       - MEDIAMTX_URL=rtsp://mediamtx:8554
+      - MEDIAMTX_API_URL=http://mediamtx:9997
+      - MEDIAMTX_WEBRTC_URL=http://mediamtx:8891
+      - DATABASE_URL=${DATABASE_URL}
     ports:
       - "8080:8080"
-    volumes:
-      - ./worker:/app
+    networks:
+      - default
+    restart: unless-stopped
 
   frontend:
     build: ./frontend
     container_name: skylark-frontend
     depends_on:
       - backend
+      - worker
     environment:
       - VITE_BACKEND_URL=http://localhost:3000
       - VITE_WEBSOCKET_URL=http://localhost:3000
-      - VITE_MEDIAMTX_URL=http://localhost:8889
+      - VITE_WORKER_URL=http://localhost:8080
+      - VITE_MEDIAMTX_URL=http://localhost:8891
     ports:
       - "5173:5173"
     volumes:
-      - ./frontend:/app
-      - /app/node_modules
+      - ./frontend:/src
+      - /src/node_modules
+    restart: unless-stopped
 
-# volumes:
+networks:
+  default:
+    driver: bridge

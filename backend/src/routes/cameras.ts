@@ -151,18 +151,19 @@ cameras.post('/:id/start', zValidator('param', cuidParamSchema), async (c) => {
       return c.json({ error: 'Camera not found' }, 404);
     }
 
-    // Update camera status
-    const updatedCamera = await prisma.camera.update({
+    // First set camera to CONNECTING status
+    await prisma.camera.update({
       where: { id: cameraId },
       data: {
-        enabled: true,
         status: 'CONNECTING'
       }
     });
 
-    // TODO: Notify Go worker to start processing
+    // Notify Go worker to start processing with improved error handling
     try {
-      const workerResponse = await fetch(`${process.env.WORKER_URL}/camera/start`, {
+      console.log(`Requesting worker to start processing camera ${camera.id}`);
+
+      const workerResponse = await fetch(`${process.env.WORKER_URL || 'http://worker:8080'}/process`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -170,19 +171,78 @@ cameras.post('/:id/start', zValidator('param', cuidParamSchema), async (c) => {
           rtspUrl: camera.rtspUrl,
           name: camera.name,
         }),
+        signal: AbortSignal.timeout(30000), // 30 second timeout
       });
 
+      const responseText = await workerResponse.text();
+
       if (!workerResponse.ok) {
-        console.warn('Worker service not available');
+        console.error(`Worker service failed for camera ${camera.id}:`, responseText);
+        // Update camera status to reflect worker failure
+        await prisma.camera.update({
+          where: { id: cameraId },
+          data: {
+            status: 'ERROR',
+            enabled: false
+          }
+        });
+
+        return c.json({
+          error: `Worker service failed: ${responseText}`,
+          camera: null
+        }, 500);
+      } else {
+        // Parse worker response
+        let workerData;
+        try {
+          workerData = JSON.parse(responseText);
+        } catch (parseError) {
+          console.error('Failed to parse worker response:', parseError);
+          workerData = { message: responseText };
+        }
+
+        console.log(`Worker successfully started processing camera ${camera.id}:`, workerData.message);
+
+        // Worker successfully started processing - enable camera and set status
+        const finalCamera = await prisma.camera.update({
+          where: { id: cameraId },
+          data: {
+            enabled: true,
+            status: 'PROCESSING'
+          },
+          include: {
+            _count: {
+              select: { alerts: true }
+            }
+          }
+        });
+
+        return c.json({
+          message: 'Camera started successfully',
+          camera: finalCamera,
+          workerInfo: {
+            pathName: workerData.pathName,
+            sessionId: workerData.sessionId
+          }
+        });
       }
     } catch (workerError) {
-      console.warn('Worker service error:', workerError);
-    }
+      console.error(`Worker service error for camera ${camera.id}:`, workerError);
+      // Update camera status to reflect error
+      await prisma.camera.update({
+        where: { id: cameraId },
+        data: {
+          status: 'ERROR',
+          enabled: false
+        }
+      });
 
-    return c.json({
-      message: 'Camera started successfully',
-      camera: updatedCamera
-    });
+      const errorMessage = workerError instanceof Error ? workerError.message : 'Unknown worker error';
+      return c.json({
+        error: `Worker service error: ${errorMessage}`,
+        camera: null
+      }, 500);
+    }
 
   } catch (error) {
     console.error('Start camera error:', error);
@@ -213,19 +273,28 @@ cameras.post('/:id/stop', zValidator('param', cuidParamSchema), async (c) => {
       }
     });
 
-    // TODO: Notify Go worker to stop processing
+    // Notify Go worker to stop processing with improved error handling
     try {
-      const workerResponse = await fetch(`${process.env.WORKER_URL}/camera/stop`, {
+      console.log(`Requesting worker to stop processing camera ${camera.id}`);
+
+      const workerResponse = await fetch(`${process.env.WORKER_URL || 'http://worker:8080'}/stop`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ cameraId: camera.id }),
+        signal: AbortSignal.timeout(15000), // 15 second timeout
       });
 
+      const responseText = await workerResponse.text();
+
       if (!workerResponse.ok) {
-        console.warn('Worker service not available');
+        console.warn(`Worker service failed to stop camera ${camera.id}:`, responseText);
+        // Don't fail the entire request, but log the warning
+      } else {
+        console.log(`Worker successfully stopped processing camera ${camera.id}`);
       }
     } catch (workerError) {
-      console.warn('Worker service error:', workerError);
+      console.warn(`Worker service error stopping camera ${camera.id}:`, workerError);
+      // Don't fail the entire request, continue with database update
     }
 
     return c.json({
