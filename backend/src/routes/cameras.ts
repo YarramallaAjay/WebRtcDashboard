@@ -1,8 +1,7 @@
 import { Hono } from 'hono';
 import { zValidator } from '@hono/zod-validator';
 import { prisma } from '../utils/db.js';
-import { authMiddleware } from '../auth/middleware.js';
-import { CreateCameraRequest, UpdateCameraRequest, JWTPayload, Variables } from '../types.js';
+import { Variables } from '../types.js';
 import { createCameraSchema, updateCameraSchema,  cuidParamSchema } from '../schemas.js';
 
 const cameras = new Hono<{ Variables: Variables }>();
@@ -38,8 +37,8 @@ cameras.post('/', zValidator('json', createCameraSchema), async (c) => {
   try {
     const { name, rtspUrl, location } = c.req.valid('json');
 
+    // Step 1: Create camera in database
     const camera = await prisma.camera.create({
-
       data: {
         name,
         rtspUrl,
@@ -52,10 +51,62 @@ cameras.post('/', zValidator('json', createCameraSchema), async (c) => {
       }
     });
 
-    return c.json({
-      message: 'Camera created successfully',
-      camera
-    }, 201);
+    // Step 2: Register camera with worker to configure MediaMTX path
+    try {
+      console.log(`Registering camera ${camera.id} with worker service`);
+
+      const workerResponse = await fetch(`${process.env.WORKER_URL || 'http://worker:8080'}/register`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          cameraId: camera.id,
+          name: camera.name,
+        }),
+        signal: AbortSignal.timeout(10000), // 10 second timeout
+      });
+
+      if (workerResponse.ok) {
+        const workerData: any = await workerResponse.json();
+        console.log(`Camera ${camera.id} registered successfully with path: ${workerData.pathName}`);
+
+        // Step 3: Update camera with MediaMTX path info from worker
+        const updatedCamera = await prisma.camera.update({
+          where: { id: camera.id },
+          data: {
+            mediamtxPath: workerData.pathName,
+            mediamtxConfigured: true,
+          },
+          include: {
+            _count: {
+              select: { alerts: true }
+            }
+          }
+        });
+
+        return c.json({
+          message: 'Camera created and registered successfully',
+          camera: updatedCamera,
+          mediamtxPath: workerData.pathName
+        }, 201);
+      } else {
+        const errorText = await workerResponse.text();
+        console.warn(`Failed to register camera ${camera.id} with worker: ${errorText}`);
+        // Camera created but not registered - can register later when starting
+        return c.json({
+          message: 'Camera created but registration pending',
+          camera,
+          warning: 'MediaMTX path will be configured when camera is started'
+        }, 201);
+      }
+    } catch (workerError) {
+      console.warn(`Worker registration error for camera ${camera.id}:`, workerError);
+      // Camera created but not registered - can register later when starting
+      return c.json({
+        message: 'Camera created but registration pending',
+        camera,
+        warning: 'MediaMTX path will be configured when camera is started'
+      }, 201);
+    }
 
   } catch (error) {
     console.error('Create camera error:', error);
@@ -151,7 +202,42 @@ cameras.post('/:id/start', zValidator('param', cuidParamSchema), async (c) => {
       return c.json({ error: 'Camera not found' }, 404);
     }
 
-    // First set camera to CONNECTING status
+    // Check if camera is already registered with MediaMTX path
+    if (!camera.mediamtxConfigured || !camera.mediamtxPath) {
+      console.log(`Camera ${camera.id} not registered, registering now...`);
+
+      // Register camera with worker first
+      try {
+        const registerResponse = await fetch(`${process.env.WORKER_URL || 'http://worker:8080'}/register`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            cameraId: camera.id,
+            name: camera.name,
+          }),
+          signal: AbortSignal.timeout(10000),
+        });
+
+        if (registerResponse.ok) {
+          const registerData: any = await registerResponse.json();
+          await prisma.camera.update({
+            where: { id: cameraId },
+            data: {
+              mediamtxPath: registerData.pathName,
+              mediamtxConfigured: true,
+            }
+          });
+          console.log(`Camera ${camera.id} registered with path ${registerData.pathName}`);
+        } else {
+          console.warn(`Failed to register camera ${camera.id}, proceeding anyway`);
+        }
+      } catch (registerError) {
+        console.warn(`Registration error for camera ${camera.id}:`, registerError);
+        // Continue anyway - worker might auto-configure
+      }
+    }
+
+    // Set camera to CONNECTING status
     await prisma.camera.update({
       where: { id: cameraId },
       data: {
@@ -171,7 +257,7 @@ cameras.post('/:id/start', zValidator('param', cuidParamSchema), async (c) => {
           rtspUrl: camera.rtspUrl,
           name: camera.name,
         }),
-        signal: AbortSignal.timeout(30000), // 30 second timeout
+        signal: AbortSignal.timeout(60000), // Increased to 60 second timeout
       });
 
       const responseText = await workerResponse.text();
@@ -335,6 +421,187 @@ cameras.get('/:id/status', zValidator('param', cuidParamSchema), async (c) => {
   } catch (error) {
     console.error('Get camera status error:', error);
     return c.json({ error: 'Failed to get camera status' }, 500);
+  }
+});
+
+// GET /api/cameras/streams - Get all cameras with MediaMTX streaming links
+cameras.get('/streams/active', async (c) => {
+  try {
+    // Get active cameras from database
+    const activeCameras = await prisma.camera.findMany({
+      where: {
+        enabled: true,
+        status: 'PROCESSING'
+      },
+      select: {
+        id: true,
+        name: true,
+        location: true,
+        status: true,
+        enabled: true,
+        mediamtxPath: true,
+        lastProcessedAt: true
+      }
+    });
+
+    // Get stream info from worker
+    let workerStreams = [];
+    try {
+      const workerResponse = await fetch(`${process.env.WORKER_URL || 'http://worker:8080'}/streams`, {
+        signal: AbortSignal.timeout(5000)
+      });
+
+      if (workerResponse.ok) {
+        const workerData:any = await workerResponse.json();
+        workerStreams = workerData.streams || [];
+      }
+    } catch (workerError) {
+      console.warn('Failed to get worker streams:', workerError);
+    }
+
+    // Combine database and worker info
+    const streamsWithLinks = activeCameras.map(camera => {
+      const workerStream = workerStreams.find((s: any) => s.cameraId === camera.id);
+      const mediamtxWebRTCURL = process.env.VITE_MEDIAMTX_URL || 'http://localhost:8891';
+      const pathName = camera.mediamtxPath || `camera_${camera.id}`;
+
+      console.log('Camera data:', { id: camera.id, enabled: camera.enabled, status: camera.status });
+
+      return {
+        id: camera.id,
+        name: camera.name,
+        location: camera.location,
+        status: camera.status,
+        enabled: camera.enabled,
+        pathName,
+        webrtcUrl: `${mediamtxWebRTCURL}/${pathName}`,
+        uptime: workerStream?.uptime || null,
+        framesProcessed: workerStream?.framesProcessed || 0,
+        lastProcessedAt: camera.lastProcessedAt
+      };
+    });
+
+    return c.json({
+      streams: streamsWithLinks,
+      total: streamsWithLinks.length
+    });
+
+  } catch (error) {
+    console.error('Get camera streams error:', error);
+    return c.json({ error: 'Failed to get camera streams' }, 500);
+  }
+});
+
+// POST /api/cameras/start-batch - Start multiple cameras
+cameras.post('/start-batch', async (c) => {
+  try {
+    const body = await c.req.json();
+    const cameraIds = body.cameraIds as string[];
+
+    if (!Array.isArray(cameraIds) || cameraIds.length === 0) {
+      return c.json({ error: 'cameraIds array is required' }, 400);
+    }
+
+    // Get cameras from database
+    const cameras = await prisma.camera.findMany({
+      where: {
+        id: { in: cameraIds }
+      }
+    });
+
+    if (cameras.length === 0) {
+      return c.json({ error: 'No cameras found' }, 404);
+    }
+
+    // Update all cameras to CONNECTING
+    await prisma.camera.updateMany({
+      where: {
+        id: { in: cameras.map(c => c.id) }
+      },
+      data: {
+        status: 'CONNECTING'
+      }
+    });
+
+    // Prepare batch request for worker
+    const batchRequest = {
+      cameras: cameras.map(camera => ({
+        cameraId: camera.id,
+        rtspUrl: camera.rtspUrl,
+        name: camera.name
+      }))
+    };
+
+    // Send batch request to worker
+    try {
+      const workerResponse = await fetch(`${process.env.WORKER_URL || 'http://worker:8080'}/process-batch`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(batchRequest),
+        signal: AbortSignal.timeout(60000) // 60 second timeout for batch
+      });
+
+      const workerData:any = await workerResponse.json();
+
+      if (!workerResponse.ok) {
+        // Update failed cameras
+        await prisma.camera.updateMany({
+          where: { id: { in: cameraIds } },
+          data: { status: 'ERROR', enabled: false }
+        });
+
+        return c.json({
+          error: 'Worker batch processing failed',
+          details: workerData
+        }, 500);
+      }
+
+      // Update cameras based on batch results
+      const results = workerData.results || [];
+      for (const result of results) {
+        if (result.success) {
+          await prisma.camera.update({
+            where: { id: result.cameraId },
+            data: {
+              enabled: true,
+              status: 'PROCESSING'
+            }
+          });
+        } else {
+          await prisma.camera.update({
+            where: { id: result.cameraId },
+            data: {
+              enabled: false,
+              status: 'ERROR'
+            }
+          });
+        }
+      }
+
+      return c.json({
+        message: `Batch start completed: ${workerData.successful}/${workerData.total} successful`,
+        successful: workerData.successful,
+        failed: workerData.failed,
+        results: workerData.results
+      });
+
+    } catch (workerError) {
+      console.error('Worker batch error:', workerError);
+      // Update all cameras to ERROR
+      await prisma.camera.updateMany({
+        where: { id: { in: cameraIds } },
+        data: { status: 'ERROR', enabled: false }
+      });
+
+      return c.json({
+        error: 'Worker service error',
+        details: workerError instanceof Error ? workerError.message : 'Unknown error'
+      }, 500);
+    }
+
+  } catch (error) {
+    console.error('Batch start error:', error);
+    return c.json({ error: 'Failed to start cameras in batch' }, 500);
   }
 });
 

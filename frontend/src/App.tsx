@@ -2,13 +2,12 @@ import { useState, useEffect } from 'react'
 import axios from 'axios'
 import Header from './components/Header'
 import CameraList from './components/CameraList'
-import WebRTCPlayer from './components/WebRTCPlayer'
+import CameraGrid from './components/CameraGrid'
 import './App.css'
 
 // API configuration - Use environment variables with fallbacks
 const API_BASE_URL = import.meta.env.VITE_BACKEND_URL ? `${import.meta.env.VITE_BACKEND_URL}/api` : 'http://localhost:3000/api'
-const WORKER_BASE_URL = import.meta.env.VITE_WORKER_URL || 'http://localhost:8080'
-const MEDIAMTX_BASE_URL = import.meta.env.VITE_MEDIAMTX_URL || 'http://localhost:9997'
+const MEDIAMTX_BASE_URL = import.meta.env.VITE_MEDIAMTX_URL || 'http://localhost:8891'
 
 // Types
 interface Camera {
@@ -143,11 +142,51 @@ function App() {
     }
   }
 
+  // Auto-start enabled cameras on load
+  const autoStartEnabledCameras = async () => {
+    try {
+      const response = await axios.get(`${API_BASE_URL}/cameras`)
+      const allCameras = response.data.cameras || []
+
+      // Find cameras that are enabled but not processing
+      const camerasToStart = allCameras.filter((cam: Camera) =>
+        cam.enabled && cam.status !== 'PROCESSING' && cam.status !== 'CONNECTING'
+      )
+
+      if (camerasToStart.length > 0) {
+        console.log(`Auto-starting ${camerasToStart.length} enabled cameras`)
+        const cameraIds = camerasToStart.map((cam: Camera) => cam.id)
+
+        // Use batch start if available, otherwise start individually
+        try {
+          await axios.post(`${API_BASE_URL}/cameras/start-batch`, { cameraIds })
+          console.log('Batch start successful')
+        } catch (batchErr) {
+          console.log('Batch start not available, starting individually')
+          // Fallback to individual starts
+          for (const camera of camerasToStart) {
+            try {
+              await axios.post(`${API_BASE_URL}/cameras/${camera.id}/start`)
+            } catch (err) {
+              console.error(`Failed to start camera ${camera.name}:`, err)
+            }
+          }
+        }
+
+        // Wait a bit then refresh
+        setTimeout(fetchCameras, 2000)
+      }
+    } catch (err) {
+      console.error('Auto-start error:', err)
+    }
+  }
+
   // Initialize data on component mount
   useEffect(() => {
     const initialize = async () => {
       setLoading(true)
-      await Promise.all([fetchCameras()])
+      await fetchCameras()
+      await autoStartEnabledCameras()
       setLoading(false)
     }
 
@@ -156,7 +195,6 @@ function App() {
     // Set up polling for real-time updates
     const interval = setInterval(() => {
       fetchCameras()
-      // fetchAlerts()
     }, 5000) // Poll every 5 seconds
 
     return () => clearInterval(interval)
@@ -191,7 +229,7 @@ function App() {
       )}
 
       <div className="container mx-auto px-4 py-6">
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
           {/* Camera List Panel */}
           <div className="lg:col-span-1">
             <CameraList
@@ -204,22 +242,13 @@ function App() {
             />
           </div>
 
-          {/* Video Player Panel */}
-          <div className="lg:col-span-2">
-            {selectedCamera ? (
-              <WebRTCPlayer
-                camera={selectedCamera}
-                workerUrl={WORKER_BASE_URL}
-                mediamtxUrl={MEDIAMTX_BASE_URL}
-              />
-            ) : (
-              <div className="bg-gray-800 rounded-lg p-8 text-center">
-                <h3 className="text-xl font-semibold mb-4">No Camera Selected</h3>
-                <p className="text-gray-400">
-                  Select a camera from the list to view its feed
-                </p>
-              </div>
-            )}
+          {/* Camera Grid Panel - Shows all active cameras */}
+          <div className="lg:col-span-3">
+            <CameraGrid
+              apiBaseUrl={API_BASE_URL}
+              mediamtxUrl={MEDIAMTX_BASE_URL}
+              refreshInterval={5000}
+            />
           </div>
         </div>
 

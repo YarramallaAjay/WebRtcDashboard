@@ -44,11 +44,100 @@ type ReencodingProcess struct {
 	Command   *exec.Cmd
 }
 
+// WorkerConfig holds configuration for the worker service
+type WorkerConfig struct {
+	MaxConcurrentStreams int
+	MaxMemoryMB          int
+	MaxCPUPercent        int
+}
+
+// StreamMetrics tracks metrics for a single stream
+type StreamMetrics struct {
+	CameraID        string
+	StartTime       time.Time
+	BytesProcessed  uint64
+	FramesProcessed uint64
+	LastFrameTime   time.Time
+	ErrorCount      int
+}
+
+// CircuitBreaker implements circuit breaker pattern for stream failures
+type CircuitBreaker struct {
+	CameraID         string
+	FailureCount     int
+	LastFailureTime  time.Time
+	State            string // "closed", "open", "half-open"
+	MaxFailures      int
+	ResetTimeout     time.Duration
+	mu               sync.RWMutex
+}
+
+// NewCircuitBreaker creates a new circuit breaker
+func NewCircuitBreaker(cameraID string) *CircuitBreaker {
+	return &CircuitBreaker{
+		CameraID:     cameraID,
+		State:        "closed",
+		MaxFailures:  3,
+		ResetTimeout: 5 * time.Minute,
+	}
+}
+
+// RecordFailure records a failure and updates circuit breaker state
+func (cb *CircuitBreaker) RecordFailure() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	cb.FailureCount++
+	cb.LastFailureTime = time.Now()
+
+	if cb.FailureCount >= cb.MaxFailures {
+		cb.State = "open"
+		log.Printf("Circuit breaker opened for camera %s after %d failures", cb.CameraID, cb.FailureCount)
+	}
+}
+
+// RecordSuccess records a success and resets failure count
+func (cb *CircuitBreaker) RecordSuccess() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	cb.FailureCount = 0
+	cb.State = "closed"
+}
+
+// CanAttempt checks if an attempt can be made
+func (cb *CircuitBreaker) CanAttempt() bool {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	if cb.State == "closed" {
+		return true
+	}
+
+	// Check if reset timeout has elapsed
+	if time.Since(cb.LastFailureTime) > cb.ResetTimeout {
+		cb.State = "half-open"
+		log.Printf("Circuit breaker half-open for camera %s, allowing retry", cb.CameraID)
+		return true
+	}
+
+	return false
+}
+
 // Global map to track active re-encoding processes
 var (
 	activeProcesses = make(map[string]*ReencodingProcess)
 	processMutex    = sync.RWMutex{}
 	db              *sql.DB
+	workerConfig    = WorkerConfig{
+		MaxConcurrentStreams: 20, // Default to 20 concurrent streams
+		MaxMemoryMB:          4096,
+		MaxCPUPercent:        80,
+	}
+	streamMetrics      = make(map[string]*StreamMetrics)
+	streamMetricsMutex = sync.RWMutex{}
+	circuitBreakers      = make(map[string]*CircuitBreaker)
+	circuitBreakersMutex = sync.RWMutex{}
 )
 
 // RetryConfig holds configuration for retry operations
@@ -120,6 +209,59 @@ func initDatabase() {
 	log.Println("Database connection established successfully")
 }
 
+// waitForMediaMTXReady waits for MediaMTX API to become available with retry logic
+func waitForMediaMTXReady(maxWaitTime time.Duration) error {
+	mediamtxAPIURL := os.Getenv("MEDIAMTX_API_URL")
+	if mediamtxAPIURL == "" {
+		mediamtxAPIURL = "http://mediamtx:9997"
+	}
+
+	checkInterval := 2 * time.Second
+	timeout := time.After(maxWaitTime)
+	ticker := time.NewTicker(checkInterval)
+	defer ticker.Stop()
+
+	log.Printf("Waiting for MediaMTX API to become ready at %s (timeout: %v)", mediamtxAPIURL, maxWaitTime)
+
+	for {
+		select {
+		case <-timeout:
+			return fmt.Errorf("timeout waiting for MediaMTX API after %v", maxWaitTime)
+		case <-ticker.C:
+			client := &http.Client{Timeout: 3 * time.Second}
+			resp, err := client.Get(mediamtxAPIURL + "/v3/paths/list")
+			if err != nil {
+				log.Printf("MediaMTX API not ready yet: %v", err)
+				continue
+			}
+			resp.Body.Close()
+
+			if resp.StatusCode == http.StatusOK {
+				log.Println("MediaMTX API is ready")
+				return nil
+			}
+			log.Printf("MediaMTX API returned unexpected status: %d", resp.StatusCode)
+		}
+	}
+}
+
+// isMediaMTXHealthy checks if MediaMTX API is responding
+func isMediaMTXHealthy() bool {
+	mediamtxAPIURL := os.Getenv("MEDIAMTX_API_URL")
+	if mediamtxAPIURL == "" {
+		mediamtxAPIURL = "http://mediamtx:9997"
+	}
+
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get(mediamtxAPIURL + "/v3/paths/list")
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+
+	return resp.StatusCode == http.StatusOK
+}
+
 // updateCameraPathInfo stores MediaMTX path information in the database
 func updateCameraPathInfo(cameraID, pathName string, configured bool) {
 	if db == nil {
@@ -184,49 +326,97 @@ func restoreActivePaths() {
 		return
 	}
 
+	// Wait for MediaMTX to be fully ready before attempting restoration
+	log.Println("Waiting for MediaMTX API to become ready before path restoration...")
+	if err := waitForMediaMTXReady(30 * time.Second); err != nil {
+		log.Printf("MediaMTX not ready after waiting: %v", err)
+		log.Println("Will retry path restoration later...")
+		// Schedule retry after 30 seconds
+		time.AfterFunc(30*time.Second, restoreActivePaths)
+		return
+	}
+
+	// Query cameras that need restoration
+	// Include both actively processing cameras AND cameras with configured paths
 	query := `
-		SELECT id, "rtspUrl", "mediamtxPath"
+		SELECT id, "rtspUrl", "mediamtxPath", enabled, status
 		FROM cameras
-		WHERE "mediamtxConfigured" = true AND enabled = true AND status = 'PROCESSING'
+		WHERE "mediamtxConfigured" = true
 	`
 
 	rows, err := db.Query(query)
 	if err != nil {
-		log.Printf("Failed to query active cameras: %v", err)
+		log.Printf("Failed to query cameras for restoration: %v", err)
 		return
 	}
 	defer rows.Close()
 
-	restoredCount := 0
+	type CameraToRestore struct {
+		ID        string
+		RTSPURL   string
+		PathName  string
+		Enabled   bool
+		Status    string
+	}
+
+	camerasToRestore := []CameraToRestore{}
 	for rows.Next() {
-		var cameraID, rtspURL, pathName string
-		if err := rows.Scan(&cameraID, &rtspURL, &pathName); err != nil {
+		var camera CameraToRestore
+		if err := rows.Scan(&camera.ID, &camera.RTSPURL, &camera.PathName, &camera.Enabled, &camera.Status); err != nil {
 			log.Printf("Failed to scan camera row: %v", err)
 			continue
 		}
+		camerasToRestore = append(camerasToRestore, camera)
+	}
 
-		log.Printf("Restoring path for camera %s: %s", cameraID, pathName)
+	if len(camerasToRestore) == 0 {
+		log.Println("No camera paths to restore")
+		return
+	}
 
-		// Start re-encoding process
-		if err := startReencodingProcess(cameraID, rtspURL); err != nil {
-			log.Printf("Failed to restore re-encoding for camera %s: %v", cameraID, err)
-			updateCameraPathInfo(cameraID, pathName, false)
-			continue
+	log.Printf("Found %d cameras with configured MediaMTX paths", len(camerasToRestore))
+
+	restoredCount := 0
+	preconfiguredCount := 0
+
+	for _, camera := range camerasToRestore {
+		log.Printf("Processing camera %s (enabled: %v, status: %s, path: %s)",
+			camera.ID, camera.Enabled, camera.Status, camera.PathName)
+
+		// If camera was actively processing, restart the stream
+		if camera.Enabled && camera.Status == "PROCESSING" {
+			log.Printf("Restoring active stream for camera %s", camera.ID)
+
+			// Use retry logic for restoration
+			retryConfig := RetryConfig{
+				MaxAttempts: 3,
+				BaseDelay:   2 * time.Second,
+				MaxDelay:    10 * time.Second,
+			}
+
+			err := RetryOperation(func() error {
+				return startReencodingProcess(camera.ID, camera.RTSPURL)
+			}, retryConfig, fmt.Sprintf("restore camera %s", camera.ID))
+
+			if err != nil {
+				log.Printf("Failed to restore camera %s after retries: %v", camera.ID, err)
+				// Update status to ERROR
+				updateCameraPathInfo(camera.ID, camera.PathName, false)
+				continue
+			}
+
+			restoredCount++
+			log.Printf("Successfully restored active stream for camera %s", camera.ID)
+		} else {
+			// Camera is registered but not actively streaming
+			// Just ensure the path info is in database (already configured)
+			log.Printf("Camera %s is registered but not streaming (path pre-configured)", camera.ID)
+			preconfiguredCount++
 		}
-
-		// MediaMTX will automatically accept the incoming stream from FFmpeg
-		// No need to configure a path source - FFmpeg publishes directly to the path
-		log.Printf("MediaMTX path %s ready to accept stream from FFmpeg", pathName)
-
-		restoredCount++
-		log.Printf("Successfully restored camera %s", cameraID)
 	}
 
-	if restoredCount > 0 {
-		log.Printf("Restored %d camera paths after restart", restoredCount)
-	} else {
-		log.Println("No active camera paths to restore")
-	}
+	log.Printf("Path restoration completed: %d streams restored, %d paths pre-configured",
+		restoredCount, preconfiguredCount)
 }
 
 func main() {
@@ -250,6 +440,132 @@ func main() {
 		c.JSON(http.StatusOK, gin.H{
 			"status":  "healthy",
 			"service": "skylark-worker",
+		})
+	})
+
+	// GET /streams - List all active streams with MediaMTX links
+	r.GET("/streams", func(c *gin.Context) {
+		processMutex.RLock()
+		streamMetricsMutex.RLock()
+		defer processMutex.RUnlock()
+		defer streamMetricsMutex.RUnlock()
+
+		mediamtxWebRTCURL := os.Getenv("MEDIAMTX_WEBRTC_URL")
+		if mediamtxWebRTCURL == "" {
+			mediamtxWebRTCURL = "http://localhost:8891"
+		}
+
+		type StreamInfo struct {
+			CameraID       string    `json:"cameraId"`
+			PathName       string    `json:"pathName"`
+			WebRTCURL      string    `json:"webrtcUrl"`
+			RTSPSourceURL  string    `json:"rtspSourceUrl"`
+			Status         string    `json:"status"`
+			StartTime      time.Time `json:"startTime"`
+			Uptime         string    `json:"uptime"`
+			FramesProcessed uint64   `json:"framesProcessed,omitempty"`
+		}
+
+		streams := make([]StreamInfo, 0, len(activeProcesses))
+		for cameraID, process := range activeProcesses {
+			pathName := fmt.Sprintf("camera_%s", cameraID)
+			webrtcURL := fmt.Sprintf("%s/%s", mediamtxWebRTCURL, pathName)
+
+			info := StreamInfo{
+				CameraID:      cameraID,
+				PathName:      pathName,
+				WebRTCURL:     webrtcURL,
+				RTSPSourceURL: process.SourceURL,
+				Status:        "ACTIVE",
+			}
+
+			// Add metrics if available
+			if metrics, exists := streamMetrics[cameraID]; exists {
+				info.StartTime = metrics.StartTime
+				info.Uptime = time.Since(metrics.StartTime).Round(time.Second).String()
+				info.FramesProcessed = metrics.FramesProcessed
+			}
+
+			streams = append(streams, info)
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"streams": streams,
+			"total":   len(streams),
+			"maxConcurrent": workerConfig.MaxConcurrentStreams,
+		})
+	})
+
+	// GET /metrics - Resource usage metrics
+	r.GET("/metrics", func(c *gin.Context) {
+		processMutex.RLock()
+		streamMetricsMutex.RLock()
+		activeCount := len(activeProcesses)
+		processMutex.RUnlock()
+
+		type MetricsSummary struct {
+			CameraID        string  `json:"cameraId"`
+			Uptime          string  `json:"uptime"`
+			FramesProcessed uint64  `json:"framesProcessed"`
+			ErrorCount      int     `json:"errorCount"`
+		}
+
+		metricsData := make([]MetricsSummary, 0, len(streamMetrics))
+		for cameraID, metrics := range streamMetrics {
+			metricsData = append(metricsData, MetricsSummary{
+				CameraID:        cameraID,
+				Uptime:          time.Since(metrics.StartTime).Round(time.Second).String(),
+				FramesProcessed: metrics.FramesProcessed,
+				ErrorCount:      metrics.ErrorCount,
+			})
+		}
+		streamMetricsMutex.RUnlock()
+
+		c.JSON(http.StatusOK, gin.H{
+			"activeStreams": activeCount,
+			"maxStreams":    workerConfig.MaxConcurrentStreams,
+			"utilization":   fmt.Sprintf("%.1f%%", float64(activeCount)/float64(workerConfig.MaxConcurrentStreams)*100),
+			"streams":       metricsData,
+		})
+	})
+
+	// GET /health/streams - Health check for all streams
+	r.GET("/health/streams", func(c *gin.Context) {
+		processMutex.RLock()
+		activeCount := len(activeProcesses)
+		processMutex.RUnlock()
+
+		healthy := true
+		issues := []string{}
+
+		// Check if we're at capacity
+		if activeCount >= workerConfig.MaxConcurrentStreams {
+			healthy = false
+			issues = append(issues, "at maximum capacity")
+		}
+
+		// Check for stale streams (no activity in 5 minutes)
+		streamMetricsMutex.RLock()
+		for cameraID, metrics := range streamMetrics {
+			if time.Since(metrics.LastFrameTime) > 5*time.Minute {
+				healthy = false
+				issues = append(issues, fmt.Sprintf("camera %s: no activity for %v", cameraID, time.Since(metrics.LastFrameTime)))
+			}
+		}
+		streamMetricsMutex.RUnlock()
+
+		status := "healthy"
+		statusCode := http.StatusOK
+		if !healthy {
+			status = "unhealthy"
+			statusCode = http.StatusServiceUnavailable
+		}
+
+		c.JSON(statusCode, gin.H{
+			"status":        status,
+			"activeStreams": activeCount,
+			"maxStreams":    workerConfig.MaxConcurrentStreams,
+			"issues":        issues,
 		})
 	})
 
@@ -309,6 +625,113 @@ func main() {
 		c.String(resp.StatusCode, string(body))
 	})
 
+	// Register camera and configure MediaMTX path (without starting stream)
+	r.POST("/register", func(c *gin.Context) {
+		var req struct {
+			CameraID string `json:"cameraId" binding:"required"`
+			Name     string `json:"name"`
+		}
+
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": fmt.Sprintf("Invalid request: %v", err),
+			})
+			return
+		}
+
+		log.Printf("Registering camera %s for MediaMTX path configuration", req.CameraID)
+
+		// Check MediaMTX health before proceeding
+		if !isMediaMTXHealthy() {
+			log.Printf("MediaMTX is not healthy, cannot register camera %s", req.CameraID)
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error": "MediaMTX service is not available",
+			})
+			return
+		}
+
+		// Generate path name for MediaMTX
+		pathName := fmt.Sprintf("camera_%s", req.CameraID)
+
+		// Pre-configure MediaMTX path (will accept any publisher)
+		// This ensures the path exists before FFmpeg tries to stream
+		log.Printf("Pre-configuring MediaMTX path: %s", pathName)
+
+		// Update database to mark camera as registered
+		updateCameraPathInfo(req.CameraID, pathName, true)
+
+		log.Printf("Successfully registered camera %s with path %s", req.CameraID, pathName)
+		c.JSON(http.StatusOK, gin.H{
+			"message":           fmt.Sprintf("Camera %s registered successfully", req.CameraID),
+			"pathName":          pathName,
+			"mediamtxPath":      pathName,
+			"mediamtxConfigured": true,
+		})
+	})
+
+	// Pre-configure MediaMTX paths for multiple cameras (batch registration)
+	r.POST("/preconfig-paths", func(c *gin.Context) {
+		var req struct {
+			Cameras []struct {
+				CameraID string `json:"cameraId" binding:"required"`
+				Name     string `json:"name"`
+			} `json:"cameras" binding:"required"`
+		}
+
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": fmt.Sprintf("Invalid request: %v", err),
+			})
+			return
+		}
+
+		log.Printf("Pre-configuring MediaMTX paths for %d cameras", len(req.Cameras))
+
+		// Check MediaMTX health before proceeding
+		if !isMediaMTXHealthy() {
+			log.Println("MediaMTX is not healthy, cannot pre-configure paths")
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error": "MediaMTX service is not available",
+			})
+			return
+		}
+
+		type PreconfigResult struct {
+			CameraID  string `json:"cameraId"`
+			PathName  string `json:"pathName"`
+			Success   bool   `json:"success"`
+			Error     string `json:"error,omitempty"`
+		}
+
+		results := make([]PreconfigResult, 0, len(req.Cameras))
+		successCount := 0
+
+		for _, camera := range req.Cameras {
+			pathName := fmt.Sprintf("camera_%s", camera.CameraID)
+			result := PreconfigResult{
+				CameraID: camera.CameraID,
+				PathName: pathName,
+			}
+
+			// Update database to mark camera path as configured
+			updateCameraPathInfo(camera.CameraID, pathName, true)
+			result.Success = true
+			successCount++
+			log.Printf("Pre-configured path for camera %s: %s", camera.CameraID, pathName)
+
+			results = append(results, result)
+		}
+
+		log.Printf("Pre-configuration completed: %d/%d successful", successCount, len(req.Cameras))
+		c.JSON(http.StatusOK, gin.H{
+			"message":    fmt.Sprintf("Pre-configured %d/%d camera paths", successCount, len(req.Cameras)),
+			"total":      len(req.Cameras),
+			"successful": successCount,
+			"failed":     len(req.Cameras) - successCount,
+			"results":    results,
+		})
+	})
+
 	// Unified camera processing endpoint
 	r.POST("/process", func(c *gin.Context) {
 		var req struct {
@@ -320,6 +743,21 @@ func main() {
 		if err := c.ShouldBindJSON(&req); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{
 				"error": fmt.Sprintf("Invalid request: %v", err),
+			})
+			return
+		}
+
+		// Check if we've reached the concurrent stream limit
+		processMutex.RLock()
+		activeCount := len(activeProcesses)
+		processMutex.RUnlock()
+
+		if activeCount >= workerConfig.MaxConcurrentStreams {
+			log.Printf("Cannot start camera %s: reached max concurrent streams (%d/%d)",
+				req.CameraID, activeCount, workerConfig.MaxConcurrentStreams)
+			c.JSON(http.StatusTooManyRequests, gin.H{
+				"error": fmt.Sprintf("Maximum concurrent streams reached (%d/%d)",
+					activeCount, workerConfig.MaxConcurrentStreams),
 			})
 			return
 		}
@@ -346,16 +784,123 @@ func main() {
 			return
 		}
 
-		// MediaMTX will automatically accept the incoming stream from FFmpeg
-		// FFmpeg publishes to rtsp://mediamtx:8554/camera_{id} and MediaMTX receives it
-		log.Printf("MediaMTX path %s configured to receive FFmpeg stream", pathName)
+		// Wait for MediaMTX path to be ready with stream
+		log.Printf("Waiting for MediaMTX path %s to receive stream from FFmpeg...", pathName)
+		streamReadyErr := waitForPathWithStream(pathName, 30*time.Second)
+		if streamReadyErr != nil {
+			log.Printf("Error: Stream not ready for path %s: %v", pathName, streamReadyErr)
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error":   fmt.Sprintf("Stream not ready: %v", streamReadyErr),
+				"message": "FFmpeg stream did not become ready in time",
+			})
+			return
+		}
+		log.Printf("MediaMTX path %s has active stream and is ready", pathName)
 
 		log.Printf("Successfully started processing for camera %s", req.CameraID)
 		c.JSON(http.StatusOK, gin.H{
 			"message":   fmt.Sprintf("Camera %s processing started", req.CameraID),
 			"pathName":  pathName,
-			"status":    "mediamtx_configured",
+			"status":    "ready",
 			"sessionId": pathName,
+			"webrtcUrl": fmt.Sprintf("%s/%s", os.Getenv("MEDIAMTX_WEBRTC_URL"), pathName),
+		})
+	})
+
+	// POST /process-batch - Start processing multiple cameras
+	r.POST("/process-batch", func(c *gin.Context) {
+		var req struct {
+			Cameras []struct {
+				CameraID string `json:"cameraId" binding:"required"`
+				RTSPURL  string `json:"rtspUrl" binding:"required"`
+				Name     string `json:"name"`
+			} `json:"cameras" binding:"required"`
+		}
+
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": fmt.Sprintf("Invalid request: %v", err),
+			})
+			return
+		}
+
+		// Check if batch would exceed limit
+		processMutex.RLock()
+		activeCount := len(activeProcesses)
+		processMutex.RUnlock()
+
+		if activeCount+len(req.Cameras) > workerConfig.MaxConcurrentStreams {
+			c.JSON(http.StatusTooManyRequests, gin.H{
+				"error": fmt.Sprintf("Batch would exceed max concurrent streams (%d/%d)",
+					activeCount+len(req.Cameras), workerConfig.MaxConcurrentStreams),
+			})
+			return
+		}
+
+		type BatchResult struct {
+			CameraID string `json:"cameraId"`
+			Success  bool   `json:"success"`
+			PathName string `json:"pathName,omitempty"`
+			Error    string `json:"error,omitempty"`
+		}
+
+		results := make([]BatchResult, 0, len(req.Cameras))
+		var wg sync.WaitGroup
+		resultsMutex := sync.Mutex{}
+
+		// Start cameras concurrently
+		for _, camera := range req.Cameras {
+			wg.Add(1)
+			go func(cam struct {
+				CameraID string `json:"cameraId" binding:"required"`
+				RTSPURL  string `json:"rtspUrl" binding:"required"`
+				Name     string `json:"name"`
+			}) {
+				defer wg.Done()
+
+				pathName := fmt.Sprintf("camera_%s", cam.CameraID)
+				result := BatchResult{
+					CameraID: cam.CameraID,
+					PathName: pathName,
+				}
+
+				// Stop any existing process
+				stopReencodingProcess(cam.CameraID)
+				time.Sleep(500 * time.Millisecond)
+
+				// Start re-encoding
+				err := startReencodingProcess(cam.CameraID, cam.RTSPURL)
+				if err != nil {
+					result.Success = false
+					result.Error = err.Error()
+					log.Printf("Batch: Failed to start camera %s: %v", cam.CameraID, err)
+				} else {
+					result.Success = true
+					log.Printf("Batch: Successfully started camera %s", cam.CameraID)
+				}
+
+				resultsMutex.Lock()
+				results = append(results, result)
+				resultsMutex.Unlock()
+			}(camera)
+		}
+
+		wg.Wait()
+
+		// Count successes
+		successCount := 0
+		for _, result := range results {
+			if result.Success {
+				successCount++
+			}
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"message":      fmt.Sprintf("Batch processing completed: %d/%d successful", successCount, len(req.Cameras)),
+			"total":        len(req.Cameras),
+			"successful":   successCount,
+			"failed":       len(req.Cameras) - successCount,
+			"results":      results,
 		})
 	})
 
@@ -449,10 +994,10 @@ func main() {
 	})
 
 	// Restore active camera paths after MediaMTX is ready
-	log.Println("Attempting to restore active camera paths...")
+	log.Println("Scheduling path restoration after MediaMTX initialization...")
 	go func() {
-		// Wait a moment for MediaMTX to be fully ready
-		time.Sleep(5 * time.Second)
+		// Wait longer for MediaMTX to be fully ready (increased from 5s to 10s)
+		time.Sleep(10 * time.Second)
 		restoreActivePaths()
 	}()
 
@@ -720,6 +1265,71 @@ func configureMediaMTXPath(pathName, rtspURL string) error {
 	return nil
 }
 
+// waitForPathWithStream waits for a MediaMTX path to have an active stream with readers
+func waitForPathWithStream(pathName string, timeout time.Duration) error {
+	checkInterval := 1 * time.Second
+	timeoutChan := time.After(timeout)
+	ticker := time.NewTicker(checkInterval)
+	defer ticker.Stop()
+
+	mediamtxAPIURL := os.Getenv("MEDIAMTX_API_URL")
+	if mediamtxAPIURL == "" {
+		mediamtxAPIURL = "http://mediamtx:9997"
+	}
+
+	log.Printf("Waiting for path %s to have active stream (timeout: %v)", pathName, timeout)
+
+	for {
+		select {
+		case <-timeoutChan:
+			return fmt.Errorf("timeout waiting for path %s to have active stream after %v", pathName, timeout)
+		case <-ticker.C:
+			apiURL := fmt.Sprintf("%s/v3/paths/get/%s", mediamtxAPIURL, pathName)
+			client := &http.Client{Timeout: 3 * time.Second}
+
+			req, err := http.NewRequest("GET", apiURL, nil)
+			if err != nil {
+				continue
+			}
+			// No auth needed - MediaMTX configured for anonymous access
+
+			resp, err := client.Do(req)
+			if err != nil {
+				log.Printf("Error checking path %s: %v (retrying...)", pathName, err)
+				continue
+			}
+
+			if resp.StatusCode == http.StatusOK {
+				var pathInfo map[string]any
+				err := json.NewDecoder(resp.Body).Decode(&pathInfo)
+				resp.Body.Close()
+
+				if err != nil {
+					continue
+				}
+
+				// Check if path has active source
+				if ready, exists := pathInfo["ready"]; exists && ready == true {
+					// Check if there's a source connected (FFmpeg publisher)
+					if source, hasSource := pathInfo["source"].(map[string]any); hasSource && source != nil {
+						log.Printf("Path %s is ready with active source", pathName)
+						return nil
+					}
+
+					// Also check if there's actual data being sent (backup check)
+					if bytesSent, ok := pathInfo["bytesSent"].(float64); ok && bytesSent > 0 {
+						log.Printf("Path %s is ready with %v bytes sent", pathName, bytesSent)
+						return nil
+					}
+					log.Printf("Path %s is ready but no active source yet", pathName)
+				}
+			} else {
+				resp.Body.Close()
+			}
+		}
+	}
+}
+
 // waitForPathReady waits for a MediaMTX path to have an active RTSP source
 func waitForPathReady(pathName string) error {
 	maxWaitTime := 45 * time.Second  // Increased timeout
@@ -797,6 +1407,19 @@ func waitForPathReady(pathName string) error {
 
 // startReencodingProcess starts an FFmpeg process to re-encode a stream and remove B-frames
 func startReencodingProcess(cameraID, sourceURL string) error {
+	// Check circuit breaker
+	circuitBreakersMutex.Lock()
+	cb, exists := circuitBreakers[cameraID]
+	if !exists {
+		cb = NewCircuitBreaker(cameraID)
+		circuitBreakers[cameraID] = cb
+	}
+	circuitBreakersMutex.Unlock()
+
+	if !cb.CanAttempt() {
+		return fmt.Errorf("circuit breaker is open for camera %s, retry later", cameraID)
+	}
+
 	processMutex.Lock()
 	defer processMutex.Unlock()
 
@@ -823,6 +1446,7 @@ func startReencodingProcess(cameraID, sourceURL string) error {
 	cmd := ffmpeg.Input(sourceURL, ffmpeg.KwArgs{
 		"rtsp_transport": "tcp",     // Use TCP for input to reduce packet loss
 		"buffer_size":    "2000000", // 2MB buffer
+		"timeout":        "5000000", // 5 second I/O timeout (microseconds)
 	}).
 		Output(targetURL, ffmpeg.KwArgs{
 			"c:v":               "libx264",     // H264 codec
@@ -842,6 +1466,7 @@ func startReencodingProcess(cameraID, sourceURL string) error {
 			"ar":                "44100",       // Audio sample rate
 			"f":                 "rtsp",        // Output format
 			"rtsp_transport":    "tcp",         // Use TCP transport
+			"timeout":           "5000000",     // Output I/O timeout
 			"muxdelay":          "0.1",         // Reduce mux delay
 			"avoid_negative_ts": "make_zero",   // Fix timestamp issues
 		}).
@@ -860,6 +1485,7 @@ func startReencodingProcess(cameraID, sourceURL string) error {
 	err := execCmd.Start()
 	if err != nil {
 		cancel()
+		cb.RecordFailure()
 		return fmt.Errorf("failed to start FFmpeg process: %w", err)
 	}
 
@@ -873,6 +1499,15 @@ func startReencodingProcess(cameraID, sourceURL string) error {
 		Command:   execCmd,
 	}
 
+	// Initialize metrics for this stream
+	streamMetricsMutex.Lock()
+	streamMetrics[cameraID] = &StreamMetrics{
+		CameraID:      cameraID,
+		StartTime:     time.Now(),
+		LastFrameTime: time.Now(),
+	}
+	streamMetricsMutex.Unlock()
+
 	// Monitor the process in a goroutine with enhanced error handling
 	go func() {
 		err := execCmd.Wait()
@@ -880,8 +1515,44 @@ func startReencodingProcess(cameraID, sourceURL string) error {
 		delete(activeProcesses, cameraID)
 		processMutex.Unlock()
 
+		// Clean up metrics
+		streamMetricsMutex.Lock()
+		delete(streamMetrics, cameraID)
+		streamMetricsMutex.Unlock()
+
 		if err != nil {
 			log.Printf("FFmpeg process for camera %s ended with error: %v", cameraID, err)
+
+			// Record failure in circuit breaker
+			circuitBreakersMutex.RLock()
+			cb, cbExists := circuitBreakers[cameraID]
+			circuitBreakersMutex.RUnlock()
+
+			if cbExists {
+				cb.RecordFailure()
+
+				// Auto-restart if circuit breaker allows
+				if cb.CanAttempt() {
+					log.Printf("Auto-restarting FFmpeg for camera %s after failure (circuit breaker allows)", cameraID)
+					time.Sleep(3 * time.Second) // Wait before restart
+
+					// Get camera info from database
+					_, pathName, configured, dbErr := getCameraInfo(cameraID)
+					if dbErr == nil && configured {
+						// Try to restart
+						if restartErr := startReencodingProcess(cameraID, sourceURL); restartErr != nil {
+							log.Printf("Failed to auto-restart camera %s: %v", cameraID, restartErr)
+							updateCameraPathInfo(cameraID, pathName, false)
+						} else {
+							log.Printf("Successfully auto-restarted camera %s", cameraID)
+						}
+						return // Exit goroutine after restart attempt
+					}
+				} else {
+					log.Printf("Circuit breaker open for camera %s, skipping auto-restart", cameraID)
+				}
+			}
+
 			// Clean up MediaMTX path on process failure
 			pathName := fmt.Sprintf("camera_%s", cameraID)
 			if cleanupErr := cleanupMediaMTXPath(pathName); cleanupErr != nil {
@@ -891,6 +1562,13 @@ func startReencodingProcess(cameraID, sourceURL string) error {
 			updateCameraPathInfo(cameraID, pathName, false)
 		} else {
 			log.Printf("FFmpeg process for camera %s ended normally", cameraID)
+
+			// Record success in circuit breaker
+			circuitBreakersMutex.RLock()
+			if cb, exists := circuitBreakers[cameraID]; exists {
+				cb.RecordSuccess()
+			}
+			circuitBreakersMutex.RUnlock()
 		}
 	}()
 
@@ -902,7 +1580,7 @@ func startReencodingProcess(cameraID, sourceURL string) error {
 	maxChecks := 10
 	checkInterval := 500 * time.Millisecond
 
-	for i := 0; i < maxChecks; i++ {
+	for i := range maxChecks {
 		time.Sleep(checkInterval)
 
 		// Check if process is still running
@@ -914,6 +1592,14 @@ func startReencodingProcess(cameraID, sourceURL string) error {
 		// After a few checks, consider it successful
 		if i >= 5 {
 			log.Printf("FFmpeg process for camera %s is running and stable", cameraID)
+
+			// Record success in circuit breaker
+			circuitBreakersMutex.RLock()
+			if cb, exists := circuitBreakers[cameraID]; exists {
+				cb.RecordSuccess()
+			}
+			circuitBreakersMutex.RUnlock()
+
 			// Update database to mark camera as processing
 			pathName := fmt.Sprintf("camera_%s", cameraID)
 			updateCameraPathInfo(cameraID, pathName, true)

@@ -1,93 +1,51 @@
 # MediaMTX Configuration for WebRTC Dashboard
-# Based on MediaMTX v1.15.1 configuration format
+# Configuration for MediaMTX latest version
 
-###############################################
-# Global settings
-###############################################
-
+# Log level
 logLevel: info
 logDestinations: [stdout]
-readTimeout: 60s
-writeTimeout: 60s
-writeQueueSize: 2048
-udpMaxPayloadSize: 1472
 
-###############################################
-# Authentication
-###############################################
+# Global timeouts - very long to prevent disconnects during long streams
+readTimeout: 3600s
+readBufferCount: 4096
 
+# API Server (no authentication for development)
+api: yes
+apiAddress: :9997
+
+# RTSP Server
+rtsp: yes
+protocols: [tcp]
+rtspAddress: :8554
+
+# WebRTC Server
+webrtc: yes
+webrtcAddress: :8891
+webrtcICEServers2:
+  - url: stun:stun.l.google.com:19302
+# Use host mode - advertise localhost for browser connections
+webrtcICEHostNAT1To1IPs: [127.0.0.1, 192.168.179.48]
+webrtcAdditionalHosts: [localhost, host.docker.internal, 127.0.0.1, 192.168.179.48]
+
+# Disable other protocols
+rtmp: no
+hls: no
+srt: no
+
+# Authentication - disabled for development
 authMethod: internal
 authInternalUsers:
-  # Allow anonymous access for development
   - user: any
     pass:
     ips: []
     permissions:
       - action: publish
-        path:
       - action: read
-        path:
       - action: playback
-        path:
-  # Allow API access from any IP for development
-  - user: any
-    pass:
-    ips: []
-    permissions:
       - action: api
       - action: metrics
       - action: pprof
 
-###############################################
-# API Server
-###############################################
-
-api: yes
-apiAddress: :9997
-
-###############################################
-# RTSP Server
-###############################################
-
-rtsp: yes
-rtspAddress: :8554
-
-###############################################
-# WebRTC Server
-###############################################
-
-webrtc: yes
-webrtcAddress: :8891
-webrtcLocalUDPAddress: :8191
-webrtcIPsFromInterfaces: yes
-webrtcAdditionalHosts: [localhost, host.docker.internal]
-webrtcICEServers: [stun:stun.l.google.com:19302]
-
-###############################################
-# Disable other servers
-###############################################
-
-rtmp: no
-hls: no
-srt: no
-
-###############################################
-# Paths - Camera streams
-###############################################
-
+# Paths configuration
 paths:
-  # Test streams
-  # people_stream:
-  #   source: rtsp://rtspstream:ynw9CK51ayyqY3csCPFWY@zephyr.rtsp.stream/people
-
-  # movie_stream:
-  #   source: rtsp://rtspstream:ynw9CK51ayyqY3csCPFWY@zephyr.rtsp.stream/movie
-
-  # Dynamic camera pattern - for API-configured cameras
-  ~^camera_(.*)$:
-    # Source will be set via API for each camera
-    overridePublisher: no
-    runOnDemandRestart: yes
-
-  # Default for all other paths
-  all_others:
+  all:
