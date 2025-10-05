@@ -8,6 +8,7 @@ interface Camera {
   enabled: boolean
   status: string
   createdAt: string
+  faceDetectionEnabled?: boolean
   _count?: {
     alerts: number
   }
@@ -19,6 +20,7 @@ interface CameraListProps {
   onCameraStart: (camera: Camera) => void
   onCameraStop: (cameraId: string) => void
   onCameraCreate: (cameraData: { name: string; rtspUrl: string; location?: string }) => void
+  onFaceDetectionToggle?: (cameraId: string, enabled: boolean) => void
   selectedCamera: Camera | null
 }
 
@@ -28,6 +30,7 @@ function CameraList({
   onCameraStart,
   onCameraStop,
   onCameraCreate,
+  onFaceDetectionToggle,
   selectedCamera,
 }: CameraListProps) {
   const [showAddForm, setShowAddForm] = useState(false)
@@ -201,6 +204,24 @@ function CameraList({
                       className="bg-green-600 hover:bg-green-700 text-white px-3 py-1 rounded text-sm"
                     >
                       Start
+                    </button>
+                  )}
+
+                  {/* Face Detection Toggle - only show if camera is running */}
+                  {camera.enabled && onFaceDetectionToggle && (
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        onFaceDetectionToggle(camera.id, !camera.faceDetectionEnabled)
+                      }}
+                      className={`px-3 py-1 rounded text-sm transition-colors ${
+                        camera.faceDetectionEnabled
+                          ? 'bg-purple-600 hover:bg-purple-700 text-white'
+                          : 'bg-gray-600 hover:bg-gray-500 text-gray-300'
+                      }`}
+                      title={camera.faceDetectionEnabled ? 'Disable face detection' : 'Enable face detection'}
+                    >
+                      👤 {camera.faceDetectionEnabled ? 'ON' : 'OFF'}
                     </button>
                   )}
                 </div>

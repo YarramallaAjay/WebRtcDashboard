@@ -1,4 +1,4 @@
-FROM node:latest
+FROM node:22-alpine
 
 WORKDIR /src
 
@@ -17,7 +17,7 @@ RUN npx prisma generate
 # Expose port
 EXPOSE 3000
 
-# Set environment to development    
+# Set environment to development
 ENV NODE_ENV=development
 
 # Start the application in development mode

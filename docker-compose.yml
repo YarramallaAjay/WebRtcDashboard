@@ -1,31 +1,29 @@
 services:
 
-  # kafka:
-  #   image: apache/kafka:latest
-  #   container_name: skylark-kafka
-  #   environment:
-  #     KAFKA_NODE_ID: 1
-  #     KAFKA_PROCESS_ROLES: broker,controller
-  #     KAFKA_LISTENERS: PLAINTEXT://localhost:9092,CONTROLLER://localhost:9093
-  #     KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
-  #     KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-  #     KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
-  #     KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
-  #     KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-  #     KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
-  #     KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
-  #     KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
-  #     KAFKA_NUM_PARTITIONS: 3
-  #   ports:
-  #     - "9092:9092"
-  #     - "9093:9093"
-  #   volumes:
-  #     - /var/lib/kafka/data:/var/lib/kafka/data
-  #   networks:
-  #     - default
-
-
-
+  kafka:
+    image: apache/kafka:latest
+    container_name: skylark-kafka
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+    networks:
+      - default
+    restart: unless-stopped
+    
   mediamtx:
     image: bluenviron/mediamtx:latest
     container_name: skylark-mediamtx
@@ -42,26 +40,23 @@ services:
     networks:
       - default
     restart: unless-stopped
-    # Resource limits for MediaMTX (handling multiple streams)
-    deploy:
-      resources:
-        limits:
-          cpus: '2.0'
-          memory: 2G
-        reservations:
-          cpus: '1.0'
-          memory: 1G
+
 
   backend:
     build: ./backend
     container_name: skylark-backend
     depends_on:
       - mediamtx
+      - kafka
     environment:
       - PORT=3000
       - DATABASE_URL=postgresql://neondb_owner:npg_P03qRGsHMAKm@ep-billowing-sea-a1g45uuo-pooler.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require
       - JWT_SECRET=skylark-assignment-BD
-      - WORKER_URL=http://worker:8080
+      - WORKER_URL=http://localhost:8080
+      - KAFKA_BROKERS=localhost:9092
+      - KAFKA_GROUP_ID=backend-alert-consumer
+      - KAFKA_TOPIC=face-detection-alerts
+      - WEBSOCKET_ENABLED=true
     ports:
       - "3000:3000"
     volumes:
@@ -75,27 +70,25 @@ services:
     depends_on:
       - mediamtx
       - backend
+      - kafka
     environment:
       - PORT=8080
-      - BACKEND_URL=http://backend:3000
-      - MEDIAMTX_URL=rtsp://mediamtx:8554
-      - MEDIAMTX_API_URL=http://mediamtx:9997
-      - MEDIAMTX_WEBRTC_URL=http://mediamtx:8891
+      - BACKEND_URL=http://localhost:3000
+      - MEDIAMTX_URL=rtsp://localhost:8554
+      - MEDIAMTX_API_URL=http://localhost:9997
+      - MEDIAMTX_WEBRTC_URL=http://localhost:8891
       - DATABASE_URL=postgresql://neondb_owner:npg_P03qRGsHMAKm@ep-billowing-sea-a1g45uuo-pooler.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require
+      - KAFKA_BROKERS=localhost:9092
+      - FACE_DETECTION_ENABLED=true
+      - FACE_DETECTION_INTERVAL=1000
+      - FACE_DETECTION_MODEL_PATH=/app/models
+      - FACE_DETECTION_CONFIDENCE_THRESHOLD=0.5
     ports:
       - "8080:8080"
     networks:
       - default
     restart: unless-stopped
-    # Resource limits for multi-camera streaming
-    deploy:
-      resources:
-        limits:
-          cpus: '4.0'
-          memory: 4G
-        reservations:
-          cpus: '2.0'
-          memory: 2G
+
 
   frontend:
     build: ./frontend
@@ -111,8 +104,51 @@ services:
     ports:
       - "5173:5173"
     volumes:
-      - ./frontend:/src
-      - /src/node_modules
+      - ./frontend:/app
+      - /app/node_modules
+    restart: unless-stopped
+
+  # Local RTSP Stream Publishers (Loop MP4 files to MediaMTX)
+  rtsp-publisher-1:
+    image: linuxserver/ffmpeg:latest
+    container_name: rtsp-publisher-1
+    command: >
+      -re -stream_loop -1 -i /videos/Big_Buck_Bunny_1080_10s_5MB.mp4
+      -c copy -f rtsp -rtsp_transport tcp rtsp://mediamtx:8554/local-cam-1
+    volumes:
+      - ./test-videos:/videos:ro
+    depends_on:
+      - mediamtx
+    networks:
+      - default
+    restart: unless-stopped
+
+  rtsp-publisher-2:
+    image: linuxserver/ffmpeg:latest
+    container_name: rtsp-publisher-2
+    command: >
+      -re -stream_loop -1 -i /videos/cosmic.mp4
+      -c copy -f rtsp -rtsp_transport tcp rtsp://localhost:8554/local-cam-2
+    volumes:
+      - ./test-videos:/videos:ro
+    depends_on:
+      - mediamtx
+    networks:
+      - default
+    restart: unless-stopped
+
+  rtsp-publisher-3:
+    image: linuxserver/ffmpeg:latest
+    container_name: rtsp-publisher-3
+    command: >
+      -re -stream_loop -1 -i /videos/nature.mp4
+      -c copy -f rtsp -rtsp_transport tcp rtsp://localhost:8554/local-cam-3
+    volumes:
+      - ./test-videos:/videos:ro
+    depends_on:
+      - mediamtx
+    networks:
+      - default
     restart: unless-stopped
 
 networks:

@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import axios from 'axios'
+import StreamLoadingOverlay from './StreamLoadingOverlay'
+import { useStreamPolling } from '../hooks/useStreamPolling'
 
 export interface CameraStream {
   id: string
@@ -14,17 +16,36 @@ export interface CameraStream {
 interface CameraTileProps {
   camera: CameraStream
   mediamtxUrl: string
+  apiBaseUrl?: string
 }
 
-export default function CameraTile({ camera, mediamtxUrl }: CameraTileProps) {
+export default function CameraTile({ camera, mediamtxUrl, apiBaseUrl }: CameraTileProps) {
   const videoRef = useRef<HTMLVideoElement>(null)
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null)
   const [connectionState, setConnectionState] = useState<RTCPeerConnectionState>('new')
   const [isConnecting, setIsConnecting] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [startTime] = useState(Date.now())
+  const [elapsedTime, setElapsedTime] = useState(0)
   const reconnectTimeoutRef = useRef<NodeJS.Timeout>()
   const retryCountRef = useRef<number>(0)
   const maxRetries = 5
+
+  // Use polling hook when camera is starting or connecting
+  const shouldPoll = camera.enabled && (camera.status === 'CONNECTING' || camera.status === 'OFFLINE')
+  const { streamStatus, isPolling } = useStreamPolling(
+    camera.id,
+    apiBaseUrl || 'http://localhost:3000/api',
+    shouldPoll
+  )
+
+  // Update elapsed time
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setElapsedTime(Date.now() - startTime)
+    }, 1000)
+    return () => clearInterval(timer)
+  }, [startTime])
 
   const iceServers = [
     { urls: 'stun:stun.l.google.com:19302' },
@@ -230,10 +251,13 @@ export default function CameraTile({ camera, mediamtxUrl }: CameraTileProps) {
           </div>
         )}
 
-        {isConnecting && (
-          <div className="absolute inset-0 bg-black/50 flex items-center justify-center">
-            <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-blue-400"></div>
-          </div>
+        {/* Show loading overlay when connecting or not yet connected */}
+        {camera.enabled && connectionState !== 'connected' && (isConnecting || camera.status === 'CONNECTING' || camera.status === 'PROCESSING') && (
+          <StreamLoadingOverlay
+            status={camera.status}
+            isPolling={isPolling}
+            elapsedTime={elapsedTime}
+          />
         )}
 
         {error && (

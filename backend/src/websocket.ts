@@ -5,7 +5,7 @@ import { JWTPayload } from './types.js';
 
 const JWT_SECRET = process.env.JWT_SECRET || 'development-secret-key';
 
-let io: SocketIOServer | null = null;
+let io: SocketIOServer;
 
 export const initializeWebSocket = (server: HTTPServer) => {
   io = new SocketIOServer(server, {
@@ -15,51 +15,53 @@ export const initializeWebSocket = (server: HTTPServer) => {
     },
   });
 
-  // Authentication middleware for WebSocket connections
-  io.use((socket, next) => {
-    const token = socket.handshake.auth.token || socket.handshake.headers.authorization?.split(' ')[1];
+  // Authentication middleware for WebSocket connections (DISABLED FOR TESTING)
+  // TODO: Re-enable authentication when auth system is active
+  // io.use((socket, next) => {
+  //   const token = socket.handshake.auth.token || socket.handshake.headers.authorization?.split(' ')[1];
 
-    if (!token) {
-      return next(new Error('Authentication token required'));
-    }
+  //   if (!token) {
+  //     return next(new Error('Authentication token required'));
+  //   }
 
-    try {
-      const payload = jwt.verify(token, JWT_SECRET) as JWTPayload;
-      socket.data.user = payload;
-      next();
-    } catch (error) {
-      next(new Error('Invalid authentication token'));
-    }
-  });
+  //   try {
+  //     const payload = jwt.verify(token, JWT_SECRET) as JWTPayload;
+  //     socket.data.user = payload;
+  //     next();
+  //   } catch (error) {
+  //     next(new Error('Invalid authentication token'));
+  //   }
+  // });
 
   io.on('connection', (socket) => {
-    const user = socket.data.user as JWTPayload;
-    console.log(`User ${user.username} connected to WebSocket`);
+    // const user = socket.data.user as JWTPayload;
+    console.log(`[WebSocket] Client connected: ${socket.id}`);
 
     // Join user to their personal room for targeted alerts
-    socket.join(`user:${user.userId}`);
+    // socket.join(`user:${user.userId}`);
 
     // Handle client requesting to join specific camera alerts
     socket.on('subscribe:camera', (cameraId: string) => {
       socket.join(`camera:${cameraId}`);
-      console.log(`User ${user.username} subscribed to camera ${cameraId} alerts`);
+      // Only log on first subscription per socket to reduce noise
+      if (socket.rooms.size === 2) { // socket.id room + first camera room
+        console.log(`[WebSocket] Client ${socket.id} subscribing to cameras...`);
+      }
     });
 
     // Handle client unsubscribing from camera alerts
     socket.on('unsubscribe:camera', (cameraId: string) => {
       socket.leave(`camera:${cameraId}`);
-      console.log(`User ${user.username} unsubscribed from camera ${cameraId} alerts`);
     });
 
     // Handle disconnect
     socket.on('disconnect', () => {
-      console.log(`User ${user.username} disconnected from WebSocket`);
+      console.log(`[WebSocket] Client ${socket.id} disconnected`);
     });
 
     // Send welcome message
     socket.emit('connected', {
       message: 'Connected to real-time alerts',
-      userId: user.userId,
       timestamp: new Date().toISOString()
     });
   });
@@ -118,3 +120,6 @@ export const broadcastCameraStatus = (cameraId: string, status: 'started' | 'sto
 };
 
 export const getIO = () => io;
+
+// Export io for use in Kafka consumer
+export { io };

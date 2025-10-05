@@ -24,18 +24,28 @@ model Camera {
   mediamtxConfigured Boolean @default(false)
   lastProcessedAt  DateTime?
 
+  // Face detection toggle
+  faceDetectionEnabled Boolean @default(false)
+
   alerts           Alert[]
 
   @@map("cameras")
 }
 
 model Alert {
-  id         String   @id @default(cuid())
-  cameraId   String
-  camera     Camera   @relation(fields: [cameraId], references: [id])
-  frameUrl   String?
-  detectedAt DateTime @default(now())
-  metadata   Json?
+  id            String   @id @default(cuid())
+  cameraId      String
+  camera        Camera   @relation(fields: [cameraId], references: [id])
+  frameUrl      String?
+  detectedAt    DateTime @default(now())
+  metadata      Json?
+
+  // Face detection fields
+  faceDetected  Boolean  @default(false)
+  faceCount     Int      @default(0)
+  confidence    Float?
 
   @@map("alerts")
+  @@index([cameraId, detectedAt])
+  @@index([faceDetected])
 }

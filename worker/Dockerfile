@@ -1,20 +1,23 @@
-# Use official golang image with Ubuntu base
-FROM golang:latest
+FROM golang:1.24-bookworm
 
 # Set environment variables
-ENV DEBIAN_FRONTEND=noninteractive
 ENV CGO_ENABLED=1
 ENV GOOS=linux
 
-# Install minimal dependencies for FFmpeg and go-face
+# Install dependencies for FFmpeg and OpenCV (gocv)
 RUN apt-get update && apt-get install -y \
     pkg-config \
     ffmpeg \
-    libblas-dev \
-    liblapack-dev \
+    libopencv-dev \
+    wget \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
+WORKDIR /
+
+# Download Haar Cascade model for face detection
+RUN mkdir -p /models && \
+    wget -O /models/haarcascade_frontalface_default.xml \
+    https://raw.githubusercontent.com/opencv/opencv/master/data/haarcascades/haarcascade_frontalface_default.xml
 
 # Copy go mod files
 COPY go.mod go.sum ./
@@ -25,20 +28,11 @@ RUN go mod download
 # Copy source code
 COPY . .
 
-# Remove existing binaries to avoid conflicts
-RUN rm -f main worker WebRtcDashBoard
-
-RUN go mod tidy
 # Build the application
-RUN echo "Building Go application..." && go build -v -o main . && echo "Build completed" && ls -la main
+RUN go build -v -o main .
 
 # Expose port
 EXPOSE 8080
 
-# Copy entrypoint script
-COPY entrypoint.sh /app/entrypoint.sh
-RUN chmod +x /app/entrypoint.sh
-
 # Start the application
-WORKDIR /app
-CMD ["/app/entrypoint.sh"]
+CMD ["./main"]

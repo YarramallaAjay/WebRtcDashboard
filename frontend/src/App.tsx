@@ -3,6 +3,8 @@ import axios from 'axios'
 import Header from './components/Header'
 import CameraList from './components/CameraList'
 import CameraGrid from './components/CameraGrid'
+import { AlertsContainer } from './components/AlertNotification'
+import { useWebSocket } from './hooks/useWebSocket'
 import './App.css'
 
 // API configuration - Use environment variables with fallbacks
@@ -18,6 +20,7 @@ interface Camera {
   enabled: boolean
   status: string
   createdAt: string
+  faceDetectionEnabled?: boolean
   _count?: {
     alerts: number
   }
@@ -47,6 +50,24 @@ function App() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
+  // Initialize WebSocket connection
+  const { connected, alerts: wsAlerts, subscribeToCamera, clearAlerts } = useWebSocket()
+
+  // Dismiss alert handler
+  const handleDismissAlert = (alertId: string) => {
+    // Remove from display (wsAlerts is managed by the hook)
+    console.log('Dismissed alert:', alertId)
+  }
+
+  // Subscribe to all cameras when they change
+  useEffect(() => {
+    if (connected && cameras.length > 0) {
+      cameras.forEach((camera) => {
+        subscribeToCamera(camera.id)
+      })
+    }
+  }, [connected, cameras])
+
   // Fetch cameras from backend
   const fetchCameras = async () => {
     try {
@@ -58,15 +79,7 @@ function App() {
     }
   }
 
-  // Fetch alerts from backend
-  // const fetchAlerts = async () => {
-  //   try {
-  //     const response = await axios.get(`${API_BASE_URL}/alerts`)
-  //     setAlerts(response.data.alerts || [])
-  //   } catch (err) {
-  //     console.error('Error fetching alerts:', err)
-  //   }
-  // }
+
 
   // Create a new camera
   const createCamera = async (cameraData: { name: string; rtspUrl: string; location?: string }) => {
@@ -142,6 +155,20 @@ function App() {
     }
   }
 
+  // Toggle face detection
+  const toggleFaceDetection = async (cameraId: string, enabled: boolean) => {
+    try {
+      const response = await axios.post(`${API_BASE_URL}/cameras/${cameraId}/face-detection/toggle`, {
+        enabled
+      })
+      console.log('Face detection toggled:', response.data)
+      fetchCameras() // Refresh to get updated status
+    } catch (err) {
+      console.error('Error toggling face detection:', err)
+      setError('Failed to toggle face detection')
+    }
+  }
+
   // Auto-start enabled cameras on load
   const autoStartEnabledCameras = async () => {
     try {
@@ -210,6 +237,16 @@ function App() {
 
   return (
     <div className="min-h-screen bg-gray-900 text-white">
+      {/* Face Detection Alerts */}
+      <AlertsContainer alerts={wsAlerts} onDismiss={handleDismissAlert} />
+
+      {/* WebSocket Connection Status */}
+      {!connected && (
+        <div className="fixed top-4 left-4 bg-yellow-600 text-white px-4 py-2 rounded-lg shadow-lg" style={{ zIndex: 9998 }}>
+          WebSocket Disconnected
+        </div>
+      )}
+
       <Header
         totalCameras={cameras.length}
         activeCameras={cameras.filter(c => c.enabled).length}
@@ -238,6 +275,7 @@ function App() {
               onCameraStart={startCamera}
               onCameraStop={stopCamera}
               onCameraCreate={createCamera}
+              onFaceDetectionToggle={toggleFaceDetection}
               selectedCamera={selectedCamera}
             />
           </div>

@@ -23,7 +23,7 @@ interface CameraGridProps {
 export default function CameraGrid({
   apiBaseUrl,
   mediamtxUrl,
-  refreshInterval = 5000,
+  refreshInterval = 100000,
 }: CameraGridProps) {
   const [streams, setStreams] = useState<CameraStream[]>([])
   const [loading, setLoading] = useState(true)
@@ -99,7 +99,12 @@ export default function CameraGrid({
 
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-2 xl:grid-cols-4 gap-4">
         {streams.map((stream) => (
-          <CameraTile key={stream.id} camera={stream} mediamtxUrl={mediamtxUrl} />
+          <CameraTile
+            key={stream.id}
+            camera={stream}
+            mediamtxUrl={mediamtxUrl}
+            apiBaseUrl={apiBaseUrl}
+          />
         ))}
       </div>
     </div>

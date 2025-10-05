@@ -18,6 +18,7 @@ import (
 	"github.com/gin-gonic/gin"
 	_ "github.com/lib/pq" // PostgreSQL driver
 	ffmpeg "github.com/u2takey/ffmpeg-go"
+	"gocv.io/x/gocv"
 )
 
 // WebRTCOfferRequest represents the incoming WebRTC offer request
@@ -63,13 +64,13 @@ type StreamMetrics struct {
 
 // CircuitBreaker implements circuit breaker pattern for stream failures
 type CircuitBreaker struct {
-	CameraID         string
-	FailureCount     int
-	LastFailureTime  time.Time
-	State            string // "closed", "open", "half-open"
-	MaxFailures      int
-	ResetTimeout     time.Duration
-	mu               sync.RWMutex
+	CameraID        string
+	FailureCount    int
+	LastFailureTime time.Time
+	State           string // "closed", "open", "half-open"
+	MaxFailures     int
+	ResetTimeout    time.Duration
+	mu              sync.RWMutex
 }
 
 // NewCircuitBreaker creates a new circuit breaker
@@ -77,8 +78,8 @@ func NewCircuitBreaker(cameraID string) *CircuitBreaker {
 	return &CircuitBreaker{
 		CameraID:     cameraID,
 		State:        "closed",
-		MaxFailures:  3,
-		ResetTimeout: 5 * time.Minute,
+		MaxFailures:  10,              // Increased from 3 to 10 for better tolerance
+		ResetTimeout: 1 * time.Minute, // Reduced from 5min to 1min for faster recovery
 	}
 }
 
@@ -134,10 +135,14 @@ var (
 		MaxMemoryMB:          4096,
 		MaxCPUPercent:        80,
 	}
-	streamMetrics      = make(map[string]*StreamMetrics)
-	streamMetricsMutex = sync.RWMutex{}
+	streamMetrics        = make(map[string]*StreamMetrics)
+	streamMetricsMutex   = sync.RWMutex{}
 	circuitBreakers      = make(map[string]*CircuitBreaker)
 	circuitBreakersMutex = sync.RWMutex{}
+	kafkaProducer        *KafkaProducer
+	faceDetector         *FaceDetector
+	faceDetectionActive  = make(map[string]context.CancelFunc) // Track active face detection goroutines
+	faceDetectionMutex   = sync.RWMutex{}
 )
 
 // RetryConfig holds configuration for retry operations
@@ -173,7 +178,7 @@ func RetryOperation(operation func() error, config RetryConfig, operationName st
 		log.Printf("Retrying '%s' in %v...", operationName, delay)
 		time.Sleep(delay)
 
-		// Double the delay for next attempt, up to max
+		// Double the delay for next attempt, up to max(Exponential Backoff)
 		delay *= 2
 		if delay > config.MaxDelay {
 			delay = config.MaxDelay
@@ -213,7 +218,7 @@ func initDatabase() {
 func waitForMediaMTXReady(maxWaitTime time.Duration) error {
 	mediamtxAPIURL := os.Getenv("MEDIAMTX_API_URL")
 	if mediamtxAPIURL == "" {
-		mediamtxAPIURL = "http://mediamtx:9997"
+		mediamtxAPIURL = "http://localhost:9997"
 	}
 
 	checkInterval := 2 * time.Second
@@ -249,7 +254,7 @@ func waitForMediaMTXReady(maxWaitTime time.Duration) error {
 func isMediaMTXHealthy() bool {
 	mediamtxAPIURL := os.Getenv("MEDIAMTX_API_URL")
 	if mediamtxAPIURL == "" {
-		mediamtxAPIURL = "http://mediamtx:9997"
+		mediamtxAPIURL = "http://localhost:9997"
 	}
 
 	client := &http.Client{Timeout: 3 * time.Second}
@@ -352,11 +357,11 @@ func restoreActivePaths() {
 	defer rows.Close()
 
 	type CameraToRestore struct {
-		ID        string
-		RTSPURL   string
-		PathName  string
-		Enabled   bool
-		Status    string
+		ID       string
+		RTSPURL  string
+		PathName string
+		Enabled  bool
+		Status   string
 	}
 
 	camerasToRestore := []CameraToRestore{}
@@ -430,6 +435,27 @@ func main() {
 	log.Println("Initializing database connection...")
 	initDatabase()
 
+	// Initialize Kafka producer
+	log.Println("Initializing Kafka producer...")
+	var err error
+	kafkaProducer, err = NewKafkaProducer("camera-events")
+	if err != nil {
+		log.Printf("Warning: Failed to initialize Kafka producer: %v", err)
+		log.Println("Face detection alerts will not be sent to Kafka")
+	} else {
+		log.Println("Kafka producer initialized successfully")
+	}
+
+	// Initialize face detector
+	log.Println("Initializing face detector...")
+	faceDetector, err = NewFaceDetector(kafkaProducer)
+	if err != nil {
+		log.Printf("Warning: Failed to initialize face detector: %v", err)
+		log.Println("Face detection will be disabled")
+	} else if faceDetector.enabled {
+		log.Println("Face detector initialized successfully")
+	}
+
 	// Create Gin router
 	r := gin.Default()
 
@@ -456,14 +482,14 @@ func main() {
 		}
 
 		type StreamInfo struct {
-			CameraID       string    `json:"cameraId"`
-			PathName       string    `json:"pathName"`
-			WebRTCURL      string    `json:"webrtcUrl"`
-			RTSPSourceURL  string    `json:"rtspSourceUrl"`
-			Status         string    `json:"status"`
-			StartTime      time.Time `json:"startTime"`
-			Uptime         string    `json:"uptime"`
-			FramesProcessed uint64   `json:"framesProcessed,omitempty"`
+			CameraID        string    `json:"cameraId"`
+			PathName        string    `json:"pathName"`
+			WebRTCURL       string    `json:"webrtcUrl"`
+			RTSPSourceURL   string    `json:"rtspSourceUrl"`
+			Status          string    `json:"status"`
+			StartTime       time.Time `json:"startTime"`
+			Uptime          string    `json:"uptime"`
+			FramesProcessed uint64    `json:"framesProcessed,omitempty"`
 		}
 
 		streams := make([]StreamInfo, 0, len(activeProcesses))
@@ -490,8 +516,8 @@ func main() {
 		}
 
 		c.JSON(http.StatusOK, gin.H{
-			"streams": streams,
-			"total":   len(streams),
+			"streams":       streams,
+			"total":         len(streams),
 			"maxConcurrent": workerConfig.MaxConcurrentStreams,
 		})
 	})
@@ -504,10 +530,10 @@ func main() {
 		processMutex.RUnlock()
 
 		type MetricsSummary struct {
-			CameraID        string  `json:"cameraId"`
-			Uptime          string  `json:"uptime"`
-			FramesProcessed uint64  `json:"framesProcessed"`
-			ErrorCount      int     `json:"errorCount"`
+			CameraID        string `json:"cameraId"`
+			Uptime          string `json:"uptime"`
+			FramesProcessed uint64 `json:"framesProcessed"`
+			ErrorCount      int    `json:"errorCount"`
 		}
 
 		metricsData := make([]MetricsSummary, 0, len(streamMetrics))
@@ -573,7 +599,7 @@ func main() {
 	r.GET("/mediamtx/paths", func(c *gin.Context) {
 		mediamtxAPIURL := os.Getenv("MEDIAMTX_API_URL")
 		if mediamtxAPIURL == "" {
-			mediamtxAPIURL = "http://mediamtx:9997"
+			mediamtxAPIURL = "http://localhost:9997"
 		}
 
 		client := &http.Client{Timeout: 5 * time.Second}
@@ -596,7 +622,7 @@ func main() {
 		pathName := c.Param("pathName")
 		mediamtxAPIURL := os.Getenv("MEDIAMTX_API_URL")
 		if mediamtxAPIURL == "" {
-			mediamtxAPIURL = "http://mediamtx:9997"
+			mediamtxAPIURL = "http://localhost:9997"
 		}
 
 		apiURL := fmt.Sprintf("%s/v3/paths/get/%s", mediamtxAPIURL, pathName)
@@ -609,7 +635,7 @@ func main() {
 			})
 			return
 		}
-		req.SetBasicAuth("admin", "admin")
+		// req.SetBasicAuth("admin", "admin")
 
 		resp, err := client.Do(req)
 		if err != nil {
@@ -662,9 +688,9 @@ func main() {
 
 		log.Printf("Successfully registered camera %s with path %s", req.CameraID, pathName)
 		c.JSON(http.StatusOK, gin.H{
-			"message":           fmt.Sprintf("Camera %s registered successfully", req.CameraID),
-			"pathName":          pathName,
-			"mediamtxPath":      pathName,
+			"message":            fmt.Sprintf("Camera %s registered successfully", req.CameraID),
+			"pathName":           pathName,
+			"mediamtxPath":       pathName,
 			"mediamtxConfigured": true,
 		})
 	})
@@ -697,10 +723,10 @@ func main() {
 		}
 
 		type PreconfigResult struct {
-			CameraID  string `json:"cameraId"`
-			PathName  string `json:"pathName"`
-			Success   bool   `json:"success"`
-			Error     string `json:"error,omitempty"`
+			CameraID string `json:"cameraId"`
+			PathName string `json:"pathName"`
+			Success  bool   `json:"success"`
+			Error    string `json:"error,omitempty"`
 		}
 
 		results := make([]PreconfigResult, 0, len(req.Cameras))
@@ -786,7 +812,7 @@ func main() {
 
 		// Wait for MediaMTX path to be ready with stream
 		log.Printf("Waiting for MediaMTX path %s to receive stream from FFmpeg...", pathName)
-		streamReadyErr := waitForPathWithStream(pathName, 30*time.Second)
+		streamReadyErr := waitForPathWithStream(pathName, 60*time.Second)
 		if streamReadyErr != nil {
 			log.Printf("Error: Stream not ready for path %s: %v", pathName, streamReadyErr)
 			c.JSON(http.StatusServiceUnavailable, gin.H{
@@ -896,11 +922,11 @@ func main() {
 		}
 
 		c.JSON(http.StatusOK, gin.H{
-			"message":      fmt.Sprintf("Batch processing completed: %d/%d successful", successCount, len(req.Cameras)),
-			"total":        len(req.Cameras),
-			"successful":   successCount,
-			"failed":       len(req.Cameras) - successCount,
-			"results":      results,
+			"message":    fmt.Sprintf("Batch processing completed: %d/%d successful", successCount, len(req.Cameras)),
+			"total":      len(req.Cameras),
+			"successful": successCount,
+			"failed":     len(req.Cameras) - successCount,
+			"results":    results,
 		})
 	})
 
@@ -921,18 +947,98 @@ func main() {
 		// Stop the re-encoding process
 		stopReencodingProcess(req.CameraID)
 
-		// Clean up MediaMTX path
+		// // Clean up MediaMTX path
 		pathName := fmt.Sprintf("camera_%s", req.CameraID)
-		if err := cleanupMediaMTXPath(pathName); err != nil {
-			log.Printf("Warning: Failed to cleanup MediaMTX path %s: %v", pathName, err)
-			// Don't fail the entire request just because cleanup failed
-		}
+		// if err := cleanupMediaMTXPath(pathName); err != nil {
+		// 	log.Printf("Warning: Failed to cleanup MediaMTX path %s: %v", pathName, err)
+		// 	// Don't fail the entire request just because cleanup failed
+		// }
 
 		log.Printf("Successfully stopped processing for camera %s", req.CameraID)
 		c.JSON(http.StatusOK, gin.H{
 			"message":  fmt.Sprintf("Stopped processing for camera %s", req.CameraID),
 			"pathName": pathName,
 		})
+	})
+
+	// POST /face-detection/toggle - Toggle face detection for a camera
+	r.POST("/face-detection/toggle", func(c *gin.Context) {
+		var req struct {
+			CameraID string `json:"cameraId" binding:"required"`
+			Enabled  bool   `json:"enabled"`
+		}
+
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": fmt.Sprintf("Invalid request: %v", err),
+			})
+			return
+		}
+
+		log.Printf("Toggle face detection for camera %s: %v", req.CameraID, req.Enabled)
+
+		if req.Enabled {
+			// Start face detection if not already running
+			processMutex.RLock()
+			process, exists := activeProcesses[req.CameraID]
+			processMutex.RUnlock()
+
+			if !exists {
+				c.JSON(http.StatusBadRequest, gin.H{
+					"error": "Camera is not actively streaming. Start the camera first.",
+				})
+				return
+			}
+
+			// Get RTSP URL from database
+			rtspURL, _, _, err := getCameraInfo(req.CameraID)
+			if err != nil {
+				log.Printf("Failed to get camera info: %v", err)
+				c.JSON(http.StatusInternalServerError, gin.H{
+					"error": fmt.Sprintf("Failed to get camera info: %v", err),
+				})
+				return
+			}
+
+			// Check if face detection is already active
+			faceDetectionMutex.RLock()
+			_, alreadyActive := faceDetectionActive[req.CameraID]
+			faceDetectionMutex.RUnlock()
+
+			if alreadyActive {
+				c.JSON(http.StatusOK, gin.H{
+					"message":  "Face detection already active for this camera",
+					"cameraId": req.CameraID,
+					"enabled":  true,
+				})
+				return
+			}
+
+			// Start face detection
+			faceDetectionCtx, faceDetectionCancel := context.WithCancel(process.Context)
+			faceDetectionMutex.Lock()
+			faceDetectionActive[req.CameraID] = faceDetectionCancel
+			faceDetectionMutex.Unlock()
+
+			startFaceDetection(req.CameraID, rtspURL, faceDetectionCtx)
+
+			log.Printf("Face detection started for camera %s", req.CameraID)
+			c.JSON(http.StatusOK, gin.H{
+				"message":  "Face detection enabled successfully",
+				"cameraId": req.CameraID,
+				"enabled":  true,
+			})
+		} else {
+			// Stop face detection
+			stopFaceDetection(req.CameraID)
+
+			log.Printf("Face detection stopped for camera %s", req.CameraID)
+			c.JSON(http.StatusOK, gin.H{
+				"message":  "Face detection disabled successfully",
+				"cameraId": req.CameraID,
+				"enabled":  false,
+			})
+		}
 	})
 
 	// WebRTC offer endpoint - now redirects to unified processing
@@ -1001,6 +1107,27 @@ func main() {
 		restoreActivePaths()
 	}()
 
+	// Setup cleanup on shutdown
+	defer func() {
+		log.Println("Shutting down worker service...")
+
+		// Close Kafka producer
+		if kafkaProducer != nil {
+			log.Println("Closing Kafka producer...")
+			if err := kafkaProducer.Close(); err != nil {
+				log.Printf("Error closing Kafka producer: %v", err)
+			}
+		}
+
+		// Close face detector
+		if faceDetector != nil {
+			log.Println("Closing face detector...")
+			faceDetector.Close()
+		}
+
+		log.Println("Worker service shutdown complete")
+	}()
+
 	// Start server
 	fmt.Printf("Worker service starting on port %s\n", port)
 	log.Fatal(r.Run(":" + port))
@@ -1010,7 +1137,7 @@ func main() {
 func cleanupMediaMTXPath(pathName string) error {
 	mediamtxAPIURL := os.Getenv("MEDIAMTX_API_URL")
 	if mediamtxAPIURL == "" {
-		mediamtxAPIURL = "http://mediamtx:9997"
+		mediamtxAPIURL = "http://localhost:9997"
 	}
 
 	// Delete the path
@@ -1051,7 +1178,7 @@ func cleanupMediaMTXPath(pathName string) error {
 func forceCleanupMediaMTXPath(pathName string) error {
 	mediamtxAPIURL := os.Getenv("MEDIAMTX_API_URL")
 	if mediamtxAPIURL == "" {
-		mediamtxAPIURL = "http://mediamtx:9997"
+		mediamtxAPIURL = "http://localhost:9997"
 	}
 
 	client := &http.Client{Timeout: 5 * time.Second}
@@ -1100,7 +1227,7 @@ func configureMediaMTXPath(pathName, rtspURL string) error {
 	// Get MediaMTX API URL from environment or default
 	mediamtxAPIURL := os.Getenv("MEDIAMTX_API_URL")
 	if mediamtxAPIURL == "" {
-		mediamtxAPIURL = "http://mediamtx:9997"
+		mediamtxAPIURL = "http://localhost:9997"
 	}
 
 	// Ensure the path is clean before creating
@@ -1274,7 +1401,7 @@ func waitForPathWithStream(pathName string, timeout time.Duration) error {
 
 	mediamtxAPIURL := os.Getenv("MEDIAMTX_API_URL")
 	if mediamtxAPIURL == "" {
-		mediamtxAPIURL = "http://mediamtx:9997"
+		mediamtxAPIURL = "http://localhost:9997"
 	}
 
 	log.Printf("Waiting for path %s to have active stream (timeout: %v)", pathName, timeout)
@@ -1348,7 +1475,7 @@ func waitForPathReady(pathName string) error {
 			// Get MediaMTX API URL from environment or default
 			mediamtxAPIURL := os.Getenv("MEDIAMTX_API_URL")
 			if mediamtxAPIURL == "" {
-				mediamtxAPIURL = "http://mediamtx:9997"
+				mediamtxAPIURL = "http://localhost:9997"
 			}
 
 			// Check if path has active source
@@ -1444,9 +1571,10 @@ func startReencodingProcess(cameraID, sourceURL string) error {
 
 	// Create FFmpeg command optimized for WebRTC streaming with minimal packet loss
 	cmd := ffmpeg.Input(sourceURL, ffmpeg.KwArgs{
-		"rtsp_transport": "tcp",     // Use TCP for input to reduce packet loss
-		"buffer_size":    "2000000", // 2MB buffer
-		"timeout":        "5000000", // 5 second I/O timeout (microseconds)
+		"rtsp_transport": "tcp",      // Use TCP for input to reduce packet loss
+		"buffer_size":    "4000000",  // 4MB buffer (increased for unstable streams)
+		"timeout":        "60000000", // 30 second I/O timeout (microseconds) - increased tolerance
+		"max_delay":      "5000000",  // 5 second max demux delay
 	}).
 		Output(targetURL, ffmpeg.KwArgs{
 			"c:v":               "libx264",     // H264 codec
@@ -1466,9 +1594,11 @@ func startReencodingProcess(cameraID, sourceURL string) error {
 			"ar":                "44100",       // Audio sample rate
 			"f":                 "rtsp",        // Output format
 			"rtsp_transport":    "tcp",         // Use TCP transport
-			"timeout":           "5000000",     // Output I/O timeout
+			"timeout":           "60000000",    // 30s Output I/O timeout (increased)
 			"muxdelay":          "0.1",         // Reduce mux delay
 			"avoid_negative_ts": "make_zero",   // Fix timestamp issues
+			"fflags":            "+genpts",     // Generate presentation timestamps
+			"err_detect":        "ignore_err",  // Ignore decoding errors to keep stream alive
 		}).
 		OverWriteOutput()
 
@@ -1508,12 +1638,42 @@ func startReencodingProcess(cameraID, sourceURL string) error {
 	}
 	streamMetricsMutex.Unlock()
 
+	// Check if face detection is enabled for this camera in the database
+	if db != nil {
+		var faceDetectionEnabled bool
+		query := `SELECT "faceDetectionEnabled" FROM cameras WHERE id = $1`
+		err := db.QueryRow(query, cameraID).Scan(&faceDetectionEnabled)
+
+		if err == nil && faceDetectionEnabled {
+			log.Printf("Face detection is enabled for camera %s, starting detection...", cameraID)
+
+			// Start face detection for this camera
+			faceDetectionMutex.Lock()
+			// Stop any existing face detection
+			if existingCancel, exists := faceDetectionActive[cameraID]; exists {
+				existingCancel()
+			}
+			// Create new context for face detection
+			faceDetectionCtx, faceDetectionCancel := context.WithCancel(context.Background())
+			faceDetectionActive[cameraID] = faceDetectionCancel
+			faceDetectionMutex.Unlock()
+
+			// Start face detection goroutine
+			startFaceDetection(cameraID, sourceURL, faceDetectionCtx)
+		} else {
+			log.Printf("Face detection is disabled for camera %s (default: false)", cameraID)
+		}
+	}
+
 	// Monitor the process in a goroutine with enhanced error handling
 	go func() {
 		err := execCmd.Wait()
 		processMutex.Lock()
 		delete(activeProcesses, cameraID)
 		processMutex.Unlock()
+
+		// Stop face detection
+		stopFaceDetection(cameraID)
 
 		// Clean up metrics
 		streamMetricsMutex.Lock()
@@ -1531,10 +1691,25 @@ func startReencodingProcess(cameraID, sourceURL string) error {
 			if cbExists {
 				cb.RecordFailure()
 
-				// Auto-restart if circuit breaker allows
+				// Auto-restart with exponential backoff if circuit breaker allows
 				if cb.CanAttempt() {
-					log.Printf("Auto-restarting FFmpeg for camera %s after failure (circuit breaker allows)", cameraID)
-					time.Sleep(3 * time.Second) // Wait before restart
+					// Calculate backoff delay based on failure count (with jitter)
+					failureCount := cb.FailureCount
+					baseDelay := 2 * time.Second
+					maxDelay := 30 * time.Second
+
+					// Exponential backoff: 2^n seconds (capped at 30s)
+					backoffDelay := time.Duration(1<<uint(failureCount)) * baseDelay
+					if backoffDelay > maxDelay {
+						backoffDelay = maxDelay
+					}
+
+					// Add jitter (±20%) to prevent thundering herd
+					jitter := time.Duration(float64(backoffDelay) * 0.2 * (2*float64(time.Now().UnixNano()%100)/100.0 - 1))
+					backoffDelay += jitter
+
+					log.Printf("Auto-restarting FFmpeg for camera %s after failure (attempt %d, waiting %v)", cameraID, failureCount, backoffDelay)
+					time.Sleep(backoffDelay)
 
 					// Get camera info from database
 					_, pathName, configured, dbErr := getCameraInfo(cameraID)
@@ -1549,7 +1724,7 @@ func startReencodingProcess(cameraID, sourceURL string) error {
 						return // Exit goroutine after restart attempt
 					}
 				} else {
-					log.Printf("Circuit breaker open for camera %s, skipping auto-restart", cameraID)
+					log.Printf("Circuit breaker open for camera %s, skipping auto-restart (will retry in %v)", cameraID, cb.ResetTimeout)
 				}
 			}
 
@@ -1615,6 +1790,9 @@ func stopReencodingProcess(cameraID string) {
 	processMutex.Lock()
 	defer processMutex.Unlock()
 
+	// Stop face detection first
+	stopFaceDetection(cameraID)
+
 	if process, exists := activeProcesses[cameraID]; exists {
 		log.Printf("Stopping re-encoding process for camera %s", cameraID)
 
@@ -1646,10 +1824,10 @@ func stopReencodingProcess(cameraID string) {
 		delete(activeProcesses, cameraID)
 
 		// Clean up MediaMTX path after stopping FFmpeg
-		pathName := fmt.Sprintf("camera_%s", cameraID)
-		if err := cleanupMediaMTXPath(pathName); err != nil {
-			log.Printf("Warning: Failed to cleanup MediaMTX path %s: %v", pathName, err)
-		}
+		// pathName := fmt.Sprintf("camera_%s", cameraID)
+		// if err := cleanupMediaMTXPath(pathName); err != nil {
+		// 	log.Printf("Warning: Failed to cleanup MediaMTX path %s: %v", pathName, err)
+		// }
 
 		log.Printf("Re-encoding process for camera %s stopped and cleaned up", cameraID)
 	} else {
@@ -1661,10 +1839,10 @@ func stopReencodingProcess(cameraID string) {
 func getReencodedStreamURL(cameraID string) string {
 	// Generate RTSP URL for publishing re-encoded stream to MediaMTX
 	// This URL must match the MediaMTX path name for proper routing
-	mediamtxURL := os.Getenv("MEDIAMTX_URL")
-	if mediamtxURL == "" {
-		mediamtxURL = "rtsp://mediamtx:8554"
-	}
+	mediamtxURL := "rtsp://localhost:8554"
+	// if mediamtxURL == "" {
+	// 	mediamtxURL = "rtsp://localhost:8554"
+	// }
 
 	// FIXED: Use consistent path naming - camera_{cameraID} (matches MediaMTX path)
 	return fmt.Sprintf("%s/camera_%s", mediamtxURL, cameraID)
@@ -1677,4 +1855,123 @@ func getCorrespondingCameraID(pathName string) string {
 		return pathName[7:]
 	}
 	return pathName // fallback
+}
+
+// getCameraName retrieves camera name from database
+func getCameraName(cameraID string) string {
+	if db == nil {
+		return ""
+	}
+
+	var name string
+	query := `SELECT name FROM cameras WHERE id = $1`
+	err := db.QueryRow(query, cameraID).Scan(&name)
+	if err != nil {
+		log.Printf("Failed to get camera name for %s: %v", cameraID, err)
+		return ""
+	}
+	return name
+}
+
+// startFaceDetection starts face detection for a camera stream
+func startFaceDetection(cameraID, rtspURL string, ctx context.Context) {
+	if faceDetector == nil || !faceDetector.enabled {
+		return
+	}
+
+	log.Printf("Starting face detection for camera %s", cameraID)
+
+	// Get camera name from database
+	cameraName := getCameraName(cameraID)
+	if cameraName == "" {
+		cameraName = fmt.Sprintf("Camera_%s", cameraID)
+	}
+
+	go func() {
+		// Retry logic for opening video capture (external streams may be slow to start)
+		var capture *gocv.VideoCapture
+		var err error
+		maxRetries := 5
+		retryDelay := 3 * time.Second
+
+		for attempt := 1; attempt <= maxRetries; attempt++ {
+			select {
+			case <-ctx.Done():
+				log.Printf("Face detection cancelled for camera %s before video capture opened", cameraID)
+				return
+			default:
+			}
+
+			capture, err = gocv.OpenVideoCapture(rtspURL)
+			if err == nil && capture != nil && capture.IsOpened() {
+				log.Printf("Successfully opened video capture for face detection on camera %s (attempt %d)", cameraID, attempt)
+				break
+			}
+
+			if err != nil {
+				log.Printf("Failed to open video capture for face detection on camera %s (attempt %d/%d): %v", cameraID, attempt, maxRetries, err)
+			}
+
+			if attempt < maxRetries {
+				log.Printf("Retrying face detection video capture in %v...", retryDelay)
+				time.Sleep(retryDelay)
+				retryDelay *= 2 // Exponential backoff
+			} else {
+				log.Printf("All attempts failed to open video capture for face detection on camera %s", cameraID)
+				return
+			}
+		}
+		defer capture.Close()
+
+		// Wait for stream to stabilize
+		time.Sleep(5 * time.Second)
+
+		img := gocv.NewMat()
+		defer img.Close()
+
+		ticker := time.NewTicker(faceDetector.interval)
+		defer ticker.Stop()
+
+		log.Printf("Face detection active for camera %s (interval: %v)", cameraID, faceDetector.interval)
+
+		for {
+			select {
+			case <-ctx.Done():
+				log.Printf("Stopping face detection for camera %s", cameraID)
+				return
+			case <-ticker.C:
+				// Read frame from video capture
+				if ok := capture.Read(&img); !ok {
+					log.Printf("Failed to read frame from camera %s for face detection", cameraID)
+					// Try to reconnect
+					capture.Close()
+					capture, err = gocv.OpenVideoCapture(rtspURL)
+					if err != nil {
+						log.Printf("Failed to reconnect video capture for camera %s: %v", cameraID, err)
+						return
+					}
+					continue
+				}
+
+				if img.Empty() {
+					continue
+				}
+
+				// Process frame for face detection
+				faceDetector.ProcessFrameForFaceDetection(cameraID, cameraName, img)
+			}
+		}
+	}()
+}
+
+// stopFaceDetection stops face detection for a camera
+func stopFaceDetection(cameraID string) {
+	faceDetectionMutex.Lock()
+	defer faceDetectionMutex.Unlock()
+
+	if cancel, exists := faceDetectionActive[cameraID]; exists {
+		log.Printf("Stopping face detection for camera %s", cameraID)
+		cancel()
+		delete(faceDetectionActive, cameraID)
+	}
 }

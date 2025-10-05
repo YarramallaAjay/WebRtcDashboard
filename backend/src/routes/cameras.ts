@@ -43,6 +43,7 @@ cameras.post('/', zValidator('json', createCameraSchema), async (c) => {
         name,
         rtspUrl,
         location,
+        enabled: true,
       },
       include: {
         _count: {
@@ -55,7 +56,7 @@ cameras.post('/', zValidator('json', createCameraSchema), async (c) => {
     try {
       console.log(`Registering camera ${camera.id} with worker service`);
 
-      const workerResponse = await fetch(`${process.env.WORKER_URL || 'http://worker:8080'}/register`, {
+      const workerResponse = await fetch(`${process.env.WORKER_URL || 'http://localhost:8080'}/register`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -208,7 +209,7 @@ cameras.post('/:id/start', zValidator('param', cuidParamSchema), async (c) => {
 
       // Register camera with worker first
       try {
-        const registerResponse = await fetch(`${process.env.WORKER_URL || 'http://worker:8080'}/register`, {
+        const registerResponse = await fetch(`${process.env.WORKER_URL || 'http://localhost:8080'}/register`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -249,7 +250,7 @@ cameras.post('/:id/start', zValidator('param', cuidParamSchema), async (c) => {
     try {
       console.log(`Requesting worker to start processing camera ${camera.id}`);
 
-      const workerResponse = await fetch(`${process.env.WORKER_URL || 'http://worker:8080'}/process`, {
+      const workerResponse = await fetch(`${process.env.WORKER_URL || 'http://localhost:8080'}/process`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -363,7 +364,7 @@ cameras.post('/:id/stop', zValidator('param', cuidParamSchema), async (c) => {
     try {
       console.log(`Requesting worker to stop processing camera ${camera.id}`);
 
-      const workerResponse = await fetch(`${process.env.WORKER_URL || 'http://worker:8080'}/stop`, {
+      const workerResponse = await fetch(`${process.env.WORKER_URL || 'http://localhost:8080'}/stop`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ cameraId: camera.id }),
@@ -447,7 +448,7 @@ cameras.get('/streams/active', async (c) => {
     // Get stream info from worker
     let workerStreams = [];
     try {
-      const workerResponse = await fetch(`${process.env.WORKER_URL || 'http://worker:8080'}/streams`, {
+      const workerResponse = await fetch(`${process.env.WORKER_URL || 'http://localhost:8080'}/streams`, {
         signal: AbortSignal.timeout(5000)
       });
 
@@ -489,6 +490,65 @@ cameras.get('/streams/active', async (c) => {
   } catch (error) {
     console.error('Get camera streams error:', error);
     return c.json({ error: 'Failed to get camera streams' }, 500);
+  }
+});
+
+// POST /api/cameras/:id/face-detection/toggle - Toggle face detection for a camera
+cameras.post('/:id/face-detection/toggle', zValidator('param', cuidParamSchema), async (c) => {
+  try {
+    const { id: cameraId } = c.req.valid('param');
+    const body = await c.req.json();
+    const enabled = body.enabled as boolean;
+
+    if (typeof enabled !== 'boolean') {
+      return c.json({ error: 'enabled must be a boolean' }, 400);
+    }
+
+    // Check if camera exists
+    const camera = await prisma.camera.findUnique({
+      where: { id: cameraId }
+    });
+
+    if (!camera) {
+      return c.json({ error: 'Camera not found' }, 404);
+    }
+
+    // Update camera face detection setting
+    const updatedCamera = await prisma.camera.update({
+      where: { id: cameraId },
+      data: {
+        faceDetectionEnabled: enabled
+      }
+    });
+
+    // Notify worker service about face detection toggle
+    try {
+      const workerResponse = await fetch(`${process.env.WORKER_URL || 'http://localhost:8080'}/face-detection/toggle`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          cameraId,
+          enabled
+        }),
+        signal: AbortSignal.timeout(5000)
+      });
+
+      if (!workerResponse.ok) {
+        console.warn(`Failed to notify worker about face detection toggle for camera ${cameraId}`);
+      }
+    } catch (workerError) {
+      console.warn(`Worker notification error for face detection toggle:`, workerError);
+    }
+
+    return c.json({
+      message: `Face detection ${enabled ? 'enabled' : 'disabled'} successfully`,
+      camera: updatedCamera,
+      faceDetectionEnabled: enabled
+    });
+
+  } catch (error) {
+    console.error('Toggle face detection error:', error);
+    return c.json({ error: 'Failed to toggle face detection' }, 500);
   }
 });
 
@@ -534,7 +594,7 @@ cameras.post('/start-batch', async (c) => {
 
     // Send batch request to worker
     try {
-      const workerResponse = await fetch(`${process.env.WORKER_URL || 'http://worker:8080'}/process-batch`, {
+      const workerResponse = await fetch(`${process.env.WORKER_URL || 'http://localhost:8080'}/process-batch`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(batchRequest),
