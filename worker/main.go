@@ -16,6 +16,7 @@ import (
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
+	"github.com/joho/godotenv"
 	_ "github.com/lib/pq" // PostgreSQL driver
 	ffmpeg "github.com/u2takey/ffmpeg-go"
 	"gocv.io/x/gocv"
@@ -425,6 +426,13 @@ func restoreActivePaths() {
 }
 
 func main() {
+	// Load .env file if it exists
+	if err := godotenv.Load(); err != nil {
+		log.Println("No .env file found, using environment variables")
+	} else {
+		log.Println("Loaded environment variables from .env file")
+	}
+
 	// Get port from environment or default to 8080
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -1888,12 +1896,15 @@ func startFaceDetection(cameraID, rtspURL string, ctx context.Context) {
 	}
 
 	go func() {
-		// Retry logic for opening video capture (external streams may be slow to start)
+		// Retry logic for opening video capture with better error handling
 		var capture *gocv.VideoCapture
 		var err error
-		maxRetries := 5
-		retryDelay := 3 * time.Second
+		maxRetries := 3
+		retryDelay := 2 * time.Second
+		consecutiveFailures := 0
+		maxConsecutiveFailures := 10
 
+		// Open capture with retry
 		for attempt := 1; attempt <= maxRetries; attempt++ {
 			select {
 			case <-ctx.Done():
@@ -1902,8 +1913,13 @@ func startFaceDetection(cameraID, rtspURL string, ctx context.Context) {
 			default:
 			}
 
+			// Use VideoCaptureFile with specific codec hints for better stability
 			capture, err = gocv.OpenVideoCapture(rtspURL)
 			if err == nil && capture != nil && capture.IsOpened() {
+				// Set buffer size to reduce latency and packet loss
+				capture.Set(gocv.VideoCaptureFPS, 15) // Limit FPS to reduce bandwidth
+				capture.Set(gocv.VideoCaptureBufferSize, 3) // Small buffer for real-time
+
 				log.Printf("Successfully opened video capture for face detection on camera %s (attempt %d)", cameraID, attempt)
 				break
 			}
@@ -1915,16 +1931,27 @@ func startFaceDetection(cameraID, rtspURL string, ctx context.Context) {
 			if attempt < maxRetries {
 				log.Printf("Retrying face detection video capture in %v...", retryDelay)
 				time.Sleep(retryDelay)
-				retryDelay *= 2 // Exponential backoff
 			} else {
 				log.Printf("All attempts failed to open video capture for face detection on camera %s", cameraID)
 				return
 			}
 		}
-		defer capture.Close()
+		defer func() {
+			if capture != nil {
+				capture.Close()
+			}
+		}()
 
-		// Wait for stream to stabilize
-		time.Sleep(5 * time.Second)
+		// Wait for stream to stabilize and discard initial frames
+		log.Printf("Waiting for stream to stabilize for camera %s...", cameraID)
+		time.Sleep(3 * time.Second)
+
+		// Discard first few frames to avoid corrupted data
+		tempImg := gocv.NewMat()
+		for i := 0; i < 10; i++ {
+			capture.Read(&tempImg)
+		}
+		tempImg.Close()
 
 		img := gocv.NewMat()
 		defer img.Close()
@@ -1941,20 +1968,45 @@ func startFaceDetection(cameraID, rtspURL string, ctx context.Context) {
 				return
 			case <-ticker.C:
 				// Read frame from video capture
-				if ok := capture.Read(&img); !ok {
-					log.Printf("Failed to read frame from camera %s for face detection", cameraID)
-					// Try to reconnect
-					capture.Close()
-					capture, err = gocv.OpenVideoCapture(rtspURL)
-					if err != nil {
-						log.Printf("Failed to reconnect video capture for camera %s: %v", cameraID, err)
-						return
+				if ok := capture.Read(&img); !ok || img.Empty() {
+					consecutiveFailures++
+					log.Printf("Failed to read frame from camera %s for face detection (failures: %d/%d)",
+						cameraID, consecutiveFailures, maxConsecutiveFailures)
+
+					// If too many failures, try to reconnect
+					if consecutiveFailures >= maxConsecutiveFailures {
+						log.Printf("Too many consecutive failures, attempting to reconnect camera %s", cameraID)
+						capture.Close()
+
+						time.Sleep(2 * time.Second) // Wait before reconnecting
+
+						capture, err = gocv.OpenVideoCapture(rtspURL)
+						if err != nil || capture == nil || !capture.IsOpened() {
+							log.Printf("Failed to reconnect video capture for camera %s: %v", cameraID, err)
+							return // Give up
+						}
+
+						// Reset settings
+						capture.Set(gocv.VideoCaptureFPS, 15)
+						capture.Set(gocv.VideoCaptureBufferSize, 3)
+
+						// Discard initial frames after reconnect
+						for i := 0; i < 5; i++ {
+							capture.Read(&img)
+						}
+
+						consecutiveFailures = 0
+						log.Printf("Successfully reconnected camera %s", cameraID)
 					}
 					continue
 				}
 
-				if img.Empty() {
-					continue
+				// Reset failure counter on successful read
+				consecutiveFailures = 0
+
+				// Validate frame before processing
+				if img.Cols() < 100 || img.Rows() < 100 {
+					continue // Frame too small, skip
 				}
 
 				// Process frame for face detection

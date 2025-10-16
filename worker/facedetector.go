@@ -73,14 +73,69 @@ func (fd *FaceDetector) DetectFaces(img gocv.Mat) (int, []image.Rectangle) {
 		return 0, nil
 	}
 
+	// Validate input frame
+	if img.Empty() || img.Cols() < 50 || img.Rows() < 50 {
+		return 0, nil
+	}
+
 	// Convert to grayscale for better face detection
 	gray := gocv.NewMat()
 	defer gray.Close()
 	gocv.CvtColor(img, &gray, gocv.ColorBGRToGray)
 
-	// Detect faces
-	faces := fd.classifier.DetectMultiScale(gray)
-	return len(faces), faces
+	// Apply Gaussian blur to reduce noise and false detections
+	gocv.GaussianBlur(gray, &gray, image.Pt(5, 5), 0, 0, gocv.BorderDefault)
+
+	// Apply histogram equalization to improve detection in varying lighting
+	gocv.EqualizeHist(gray, &gray)
+
+	// VERY STRICT parameters to minimize false positives
+	// Parameters: scaleFactor=1.15, minNeighbors=8, minSize=(60x60)
+	// - scaleFactor: 1.15 = less sensitive, skips more scales
+	// - minNeighbors: 8 = require 8+ overlapping detections (VERY strict)
+	// - minSize: 60x60 = only detect reasonably sized faces
+	faces := fd.classifier.DetectMultiScaleWithParams(
+		gray,
+		1.15,              // scaleFactor: higher = less sensitive
+		8,                 // minNeighbors: VERY high to minimize false positives (was 6)
+		0,                 // flags
+		image.Pt(60, 60),  // minSize: larger minimum (was 40x40)
+		image.Pt(400, 400), // maxSize: limit max face size to avoid weird detections
+	)
+
+	// Additional multi-stage filtering
+	validFaces := make([]image.Rectangle, 0)
+	for _, face := range faces {
+		// 1. Aspect ratio check: faces should be roughly square
+		aspectRatio := float64(face.Dx()) / float64(face.Dy())
+		if aspectRatio < 0.75 || aspectRatio > 1.25 {
+			continue // Too narrow or too wide
+		}
+
+		// 2. Size check: face should be reasonable size
+		faceArea := face.Dx() * face.Dy()
+		if faceArea < 3600 || faceArea > 160000 { // 60x60 to 400x400
+			continue
+		}
+
+		// 3. Position check: face should not be at extreme edges
+		imgWidth := img.Cols()
+		imgHeight := img.Rows()
+		margin := 10 // pixels from edge
+
+		if face.Min.X < margin || face.Min.Y < margin ||
+			face.Max.X > imgWidth-margin || face.Max.Y > imgHeight-margin {
+			continue // Too close to edge, likely false positive
+		}
+
+		validFaces = append(validFaces, face)
+	}
+
+	if len(faces) > 0 || len(validFaces) > 0 {
+		log.Printf("[FaceDetector] Raw detections: %d, Valid faces after filtering: %d", len(faces), len(validFaces))
+	}
+
+	return len(validFaces), validFaces
 }
 
 // ProcessFrameForFaceDetection processes a frame and sends alert if faces detected
@@ -143,8 +198,12 @@ func (fd *FaceDetector) ProcessFrameForFaceDetection(cameraID, cameraName string
 		Metadata:   metadata,
 	}
 
-	if err := fd.kafkaProducer.PublishAlert(alert); err != nil {
-		log.Printf("Failed to publish face detection alert: %v", err)
+	if fd.kafkaProducer != nil {
+		if err := fd.kafkaProducer.PublishAlert(alert); err != nil {
+			log.Printf("Failed to publish face detection alert: %v", err)
+		}
+	} else {
+		log.Printf("Kafka producer not available, skipping alert publication for camera %s (faces detected: %d)", cameraID, faceCount)
 	}
 }
 

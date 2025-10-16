@@ -290,7 +290,7 @@ function App() {
           </div>
         </div>
 
-        {/* Recent Alerts Section
+        Recent Alerts Section
         {alerts.length > 0 && (
           <div className="mt-8">
             <h2 className="text-2xl font-bold mb-4">Recent Alerts</h2>
@@ -312,7 +312,7 @@ function App() {
               </div>
             </div>
           </div>
-        )} */}
+        )}
       </div>
     </div>
   )

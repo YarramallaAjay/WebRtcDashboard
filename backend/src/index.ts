@@ -1,21 +1,21 @@
 import 'dotenv/config';
 import { Hono } from 'hono';
-import { serve, createAdaptorServer } from '@hono/node-server';
+import { serve } from '@hono/node-server';
 import { cors } from 'hono/cors';
 import { logger } from 'hono/logger';
 // import { auth } from './routes/auth.js';
 import { cameras } from './routes/cameras.js';
 // import { cameraControl } from './routes/cameraControl.js';
 import { alerts } from './routes/alerts.js';
-import { initializeWebSocket } from './websocket.js';
-import { getKafkaConsumer } from './services/kafkaConsumer.js';
+import { system } from './routes/system.js';
+import { getHealthChecker } from './services/healthChecker.js';
 
 const app = new Hono();
 
 // Middleware
 app.use('*', logger());
 app.use('*', cors({
-  origin: ['http://localhost:5173', 'http://localhost:3000', 'http://localhost:8080'],
+  origin: '*',
   allowHeaders: ['Content-Type', 'Authorization'],
   allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   credentials: true,
@@ -31,6 +31,7 @@ app.get('/health', (c) => {
 app.route('/api/cameras', cameras);
 // app.route('/api/cameras', cameraControl);
 app.route('/api/alerts', alerts);
+app.route('/api/system', system);
 
 // Default route
 app.get('/', (c) => {
@@ -47,45 +48,52 @@ app.get('/', (c) => {
 
 const port = parseInt(process.env.PORT || '3000');
 
-console.log(`Server starting on port ${port}`);
+console.log('==========================================');
+console.log('Backend API Server Starting...');
+console.log('==========================================');
+console.log('Environment Configuration:');
+console.log(`  PORT: ${process.env.PORT || '3000'}`);
+console.log(`  DATABASE_URL: ${process.env.DATABASE_URL ? '***configured***' : 'NOT SET'}`);
+console.log(`  JWT_SECRET: ${process.env.JWT_SECRET ? '***configured***' : 'NOT SET'}`);
+console.log(`  WORKER_URL: ${process.env.WORKER_URL || 'NOT SET'}`);
+console.log('==========================================');
+console.log('NOTE: WebSocket and Kafka services are handled by websocket-backend service');
+console.log('==========================================');
 
-// Create HTTP server using createAdaptorServer
-const server = createAdaptorServer(app);
+// Initialize health checker
+const healthChecker = getHealthChecker();
+healthChecker.start().catch((error) => {
+  console.error('[HealthChecker] Failed to start:', error);
+});
 
 // Start the server
-server.listen(port, () => {
-  console.log(`Server running at http://localhost:${port}`);
-  console.log('WebSocket server ready');
+serve({
+  fetch: app.fetch,
+  port,
 });
 
-// Initialize WebSocket server
-console.log('Initializing WebSocket server...');
-initializeWebSocket(server as any);
-
-// Start Kafka consumer
-console.log('Starting Kafka consumer...');
-const kafkaConsumer = getKafkaConsumer();
-kafkaConsumer.start().catch((error) => {
-  console.error('Failed to start Kafka consumer:', error);
-  console.warn('Application will continue without face detection alerts');
-});
-
+console.log('==========================================');
+console.log(`✓ Backend API Server running at http://localhost:${port}`);
+console.log('==========================================');
+console.log('Available Routes:');
+console.log('  GET  /health');
+console.log('  GET  /api/cameras');
+console.log('  POST /api/cameras');
+console.log('  GET  /api/alerts');
+console.log('  GET  /api/system/health');
+console.log('  GET  /api/system/health/:service');
+console.log('  GET  /api/system/ready');
+console.log('==========================================');
 
 // Graceful shutdown
-process.on('SIGTERM', async () => {
+process.on('SIGTERM', () => {
   console.log('SIGTERM received, shutting down gracefully...');
-  await kafkaConsumer.stop();
-  server.close(() => {
-    console.log('Server closed');
-    process.exit(0);
-  });
+  healthChecker.stop();
+  process.exit(0);
 });
 
-process.on('SIGINT', async () => {
+process.on('SIGINT', () => {
   console.log('SIGINT received, shutting down gracefully...');
-  await kafkaConsumer.stop();
-  server.close(() => {
-    console.log('Server closed');
-    process.exit(0);
-  });
+  healthChecker.stop();
+  process.exit(0);
 });

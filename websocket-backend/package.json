@@ -1,0 +1,25 @@
+{
+  "name": "websocket-backend",
+  "version": "1.0.0",
+  "description": "WebSocket service for real-time face detection alerts",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "npm run build && nodemon --exec tsx src/index.ts",
+    "build": "tsc -b",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "kafkajs": "^2.2.4",
+    "socket.io": "^4.8.1",
+    "dotenv": "^16.4.7",
+    "cors": "^2.8.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/cors": "^2.8.17",
+    "typescript": "^5.7.2",
+    "tsx": "^4.19.2",
+    "nodemon": "^3.1.9"
+  }
+}

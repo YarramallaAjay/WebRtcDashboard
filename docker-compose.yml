@@ -31,7 +31,7 @@ services:
       # Using config file for all settings
       MTX_PROTOCOLS: "tcp"
     ports:
-      - "8554:8554"    # RTSP
+      - "8554:8554"    # RTSPFkafz
       - "9997:9997"    # API Server
       - "8891:8891"    # WebRTC HTTP
       - "8189:8189/udp" # WebRTC ICE/UDP (MediaMTX default)

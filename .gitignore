@@ -10,3 +10,4 @@ build/
 postgres_data/
 tmp/
 vendor/
+tests/*

@@ -8,6 +8,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/joho/godotenv"
 	"github.com/segmentio/kafka-go"
 )
 
@@ -30,6 +31,11 @@ type FaceDetectionAlert struct {
 
 // NewKafkaProducer creates a new Kafka producer
 func NewKafkaProducer(topic string) (*KafkaProducer, error) {
+	if err := godotenv.Load(); err != nil {
+		log.Println("No .env file found, using environment variables")
+	} else {
+		log.Println("Loaded environment variables from .env file")
+	}
 	brokers := os.Getenv("KAFKA_BROKERS")
 	if brokers == "" {
 		brokers = "localhost:9092"
@@ -43,7 +49,7 @@ func NewKafkaProducer(topic string) (*KafkaProducer, error) {
 		BatchTimeout: 10 * time.Millisecond,
 		RequiredAcks: kafka.RequireOne,
 		Async:        false, // Synchronous for reliability
-		Compression:  kafka.Snappy,
+		Compression:  kafka.Gzip, // Use Gzip instead of Snappy (better compatibility)
 	}
 
 	// Test connection
